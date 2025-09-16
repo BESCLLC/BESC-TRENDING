@@ -6,7 +6,7 @@ import { DateTime } from 'luxon';
 const {
   TELEGRAM_TOKEN,
   TELEGRAM_CHAT_ID,
-  POLL_INTERVAL_MINUTES = '10',
+  POLL_INTERVAL_MINUTES = '5',
   TRENDING_SIZE = '5',
   HYPERCHARTS_BASE = 'https://api.beschypercharts.com'
 } = process.env;
@@ -17,110 +17,103 @@ if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
 const bot = new TelegramBot(TELEGRAM_TOKEN);
 let lastPinnedId = null;
 
+function safeFloat(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : 0;
+}
+
 function fmtUsd(n) {
-  const v = Number(n) || 0;
-  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(2)}M`;
-  if (v >= 1_000) return `$${(v / 1_000).toFixed(2)}K`;
-  return `$${v.toFixed(2)}`;
+  if (!n || n <= 0) return `$0.00`;
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `$${(n / 1_000).toFixed(2)}K`;
+  return `$${n.toFixed(2)}`;
 }
 
 async function fetchPairs() {
-  const { data } = await axios.get(`${HYPERCHARTS_BASE}/token/pairs/all`, { timeout: 20000 });
-  return (data?.success?.data || []).filter(p => (p.liquidityUsd ?? 0) > 50); // filter out zero-liquidity junk
+  try {
+    const { data } = await axios.get(`${HYPERCHARTS_BASE}/token/pairs/all`, { timeout: 10000 });
+    return (data?.success?.data || []).filter(p => safeFloat(p.liquidityUsd) > 0);
+  } catch (e) {
+    console.error('[TrendingBot] Failed to fetch pairs:', e.message);
+    return [];
+  }
 }
 
-async function fetchTokenInfo(address) {
+async function fetchTokenInfo(contract) {
   try {
-    const { data } = await axios.get(`${HYPERCHARTS_BASE}/token/info/${address}`, { timeout: 15000 });
-    return data?.data || null;
+    const { data } = await axios.get(`${HYPERCHARTS_BASE}/token/info/${contract}`, { timeout: 10000 });
+    return data?.success?.data || null;
   } catch {
     return null;
   }
 }
 
-async function fetchRecentTxs(pairAddress) {
-  const from = Math.floor(DateTime.utc().minus({ minutes: Number(POLL_INTERVAL_MINUTES) }).toSeconds());
-  const to = Math.floor(DateTime.utc().toSeconds());
-  try {
-    const { data } = await axios.get(
-      `${HYPERCHARTS_BASE}/transactions/${pairAddress}?from=${from}&to=${to}`,
-      { timeout: 20000 }
-    );
-    return data?.data || [];
-  } catch {
-    return [];
-  }
-}
-
 async function computeTrending() {
   const pairs = await fetchPairs();
-  if (!pairs.length) return { trending: [], isFallback: true };
+  const cutoff = DateTime.utc().minus({ minutes: Number(POLL_INTERVAL_MINUTES) });
+  const results = [];
 
-  // Collect unique token addresses
-  const tokenAddrs = new Set();
-  pairs.forEach(p => {
-    if (p.token0?.contract) tokenAddrs.add(p.token0.contract.toLowerCase());
-    if (p.token1?.contract) tokenAddrs.add(p.token1.contract.toLowerCase());
-  });
+  for (const pair of pairs) {
+    let trades = [];
 
-  // Fetch token prices in parallel
-  const tokenPrices = {};
-  await Promise.all(
-    [...tokenAddrs].map(async (addr) => {
-      const info = await fetchTokenInfo(addr);
-      if (info?.pair?.pairInfos?.value) tokenPrices[addr] = Number(info.pair.pairInfos.value);
-    })
-  );
+    // Get token0 + token1 info and merge transactions for this pair
+    const [info0, info1] = await Promise.all([
+      fetchTokenInfo(pair.token0.contract),
+      fetchTokenInfo(pair.token1.contract)
+    ]);
 
-  const scored = [];
-  for (const p of pairs) {
-    const txs = await fetchRecentTxs(p.pair);
-    if (!txs.length) continue;
+    [info0?.transactions, info1?.transactions].forEach(txList => {
+      if (!txList) return;
+      txList.forEach(t => {
+        if (t.pair?.toLowerCase() === pair.pair.toLowerCase()) {
+          if (DateTime.fromSeconds(Math.floor(t.time)) >= cutoff) {
+            trades.push(t);
+          }
+        }
+      });
+    });
 
-    let volUsd = 0;
-    for (const tx of txs) {
-      const priceIn = tokenPrices[tx.tokenIn?.toLowerCase()] ?? 0;
-      const priceOut = tokenPrices[tx.tokenOut?.toLowerCase()] ?? 0;
-      volUsd += (Number(tx.amountIn || 0) * priceIn) + (Number(tx.amountOut || 0) * priceOut);
-    }
+    if (!trades.length) continue;
 
-    scored.push({
-      pair: p,
-      volUsd,
-      txCount: txs.length,
-      score: volUsd * 0.5 + txs.length * 15
+    const volume = trades.reduce((sum, t) => sum + safeFloat(t.amountIn), 0);
+    results.push({
+      pair,
+      volume,
+      trades: trades.length,
+      score: volume * 0.7 + trades.length * 15
     });
   }
 
-  scored.sort((a, b) => b.score - a.score);
+  results.sort((a, b) => b.score - a.score);
 
-  // fallback if no activity
-  if (!scored.length) {
+  if (!results.length) {
     const fallback = pairs
-      .sort((a, b) => (b.liquidityUsd ?? 0) - (a.liquidityUsd ?? 0))
-      .slice(0, TRENDING_SIZE)
-      .map(p => ({ pair: p, volUsd: 0, txCount: p.transactions24h ?? 0, score: 0 }));
+      .sort((a, b) => safeFloat(b.liquidityUsd) - safeFloat(a.liquidityUsd))
+      .slice(0, Number(TRENDING_SIZE))
+      .map(p => ({ pair: p, volume: 0, trades: p.transactions24h ?? 0, score: 0 }));
     return { trending: fallback, isFallback: true };
   }
 
-  return { trending: scored.slice(0, TRENDING_SIZE), isFallback: false };
+  return { trending: results.slice(0, Number(TRENDING_SIZE)), isFallback: false };
 }
 
 function formatTrending({ trending, isFallback }) {
-  const title = isFallback
+  const header = isFallback
     ? `💤 <b>BESC HyperChain — Quiet Market</b>\n📊 Showing top pairs by liquidity:\n`
     : `🔥 <b>BESC HyperChain — Top ${trending.length} Trending</b>\n🕒 Last ${POLL_INTERVAL_MINUTES} min snapshot\n`;
 
-  const lines = [title];
+  const lines = [header];
 
   trending.forEach((x, i) => {
-    const t0 = x.pair.token0.symbol || '?';
-    const t1 = x.pair.token1.symbol || '?';
+    const p = x.pair;
+    const t0 = p.token0.symbol || '?';
+    const t1 = p.token1.symbol || '?';
+    const link = `https://beschypercharts.com/pair/${p.pair}`;
     lines.push(
       `${i + 1}️⃣ <b>${t0}/${t1}</b>\n` +
-      `💵 Vol: ${fmtUsd(x.volUsd)} | 🧮 Tx: ${x.txCount}\n` +
-      `💧 LQ: ${fmtUsd(x.pair.liquidityUsd)}\n` +
-      `<a href="https://beschypercharts.com/pair/${x.pair.pair}">View Pair</a>\n`
+      `💵 Vol: ${fmtUsd(x.volume)} | 🧮 Tx: ${x.trades}\n` +
+      `💧 LQ: ${fmtUsd(safeFloat(p.liquidityUsd))}\n` +
+      `<a href="${link}">View Pair</a>\n`
     );
   });
 
@@ -130,6 +123,7 @@ function formatTrending({ trending, isFallback }) {
 async function postTrending() {
   try {
     const result = await computeTrending();
+    console.log(`[TrendingBot] Found ${result.trending.length} trending pairs`);
 
     if (lastPinnedId) {
       await bot.unpinAllChatMessages(TELEGRAM_CHAT_ID).catch(() => {});
@@ -144,8 +138,7 @@ async function postTrending() {
 
     await bot.pinChatMessage(TELEGRAM_CHAT_ID, msg.message_id, { disable_notification: true });
     lastPinnedId = msg.message_id;
-
-    console.log(`[TrendingBot] ✅ Posted trending (${result.trending.length} pairs)${result.isFallback ? ' [Fallback]' : ''}`);
+    console.log(`[TrendingBot] ✅ Posted trending`);
   } catch (e) {
     console.error('[TrendingBot] Failed to post trending:', e.message);
   }
