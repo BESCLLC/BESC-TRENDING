@@ -30,7 +30,7 @@ function fmtUsd(n) {
 
 async function fetchPairs() {
   try {
-    const { data } = await axios.get(`${HC_BASE}/token/pairs/all`, { timeout: 15000 });
+    const { data } = await axios.get(`${HC_BASE}/token/pairs/all?t=${Date.now()}`, { timeout: 15000 });
     const pairs = (data?.success?.data || []).filter(p => safeFloat(p.liquidityUsd) >= 100);
     console.log(`[TrendingBot] Fetched ${pairs.length} pairs with liquidity >= $100`);
     return pairs;
@@ -43,27 +43,28 @@ async function fetchPairs() {
 async function fetchTokenInfo(contract) {
   for (let i = 0; i < 3; i++) {
     try {
-      const { data } = await axios.get(`${HC_BASE}/token/info/${contract}`, { timeout: 15000 });
+      const { data } = await axios.get(`${HC_BASE}/token/info/${contract}?t=${Date.now()}`, { timeout: 15000 });
       const info = data?.success?.data || null;
       console.log(`[TrendingBot] Fetched info for contract ${contract}: ${info ? `Success, ${info.transactions?.length || 0} transactions` : 'No data'}`);
-      if (info && !info.transactions) console.log(`[TrendingBot] Raw response for ${contract}:`, JSON.stringify(data, null, 2));
+      if (info && !info.transactions) console.log(`[TrendingBot] Raw response for ${contract}:`, JSON.stringify(data.success.data, null, 2));
       return info;
     } catch (e) {
       console.error(`[TrendingBot] Attempt ${i + 1} failed for ${contract}: ${e.message}`);
       if (i === 2) return null;
-      await new Promise(resolve => setTimeout(resolve, 2000)); // 2s delay between retries
+      await new Promise(resolve => setTimeout(resolve, 3000)); // 3s delay
     }
   }
 }
 
 async function computeTrending() {
   const pairs = await fetchPairs();
-  const cutoff = DateTime.utc().minus({ minutes: Number(POLL_INTERVAL_MINUTES) * 2 }); // Double window for testing
+  const cutoff = DateTime.utc().minus({ minutes: Number(POLL_INTERVAL_MINUTES) * 2 });
   console.log(`[TrendingBot] Cutoff time: ${cutoff.toISO()}`);
   const trending = [];
 
   for (const p of pairs) {
     console.log(`[TrendingBot] Processing pair ${p.token0.symbol}/${p.token1.symbol} (${p.pair})`);
+    await new Promise(resolve => setTimeout(resolve, 500)); // 500ms delay between requests
 
     // Fetch transactions for both tokens
     const info0 = await fetchTokenInfo(p.token0.contract);
@@ -93,7 +94,7 @@ async function computeTrending() {
     console.log(`[TrendingBot] Price for ${p.token0.symbol}/${p.token1.symbol}: ${price}`);
 
     let volUsd = 0;
-    const mainToken = info0?.pair?.pairInfos?.mainToken || p.token1.contract; // Fallback to token1
+    const mainToken = info0?.pair?.pairInfos?.mainToken || p.token1.contract;
     for (const tx of transactions) {
       const amountIn = safeFloat(tx.amountIn);
       const amountOut = safeFloat(tx.amountOut);
