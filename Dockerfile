@@ -1,25 +1,20 @@
-# Use a stable full Python image for maximum compatibility
-FROM python:3.11
-
-# Prevent Python from writing .pyc files and buffer stdout (for instant Railway logs)
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+# Use an official Node.js LTS image (stable for production)
+FROM node:20-alpine
 
 # Set working directory
 WORKDIR /app
 
-# Ensure directory has correct permissions
-RUN mkdir -p /app && chown -R 1000:1000 /app
+# Copy package files first (better layer caching)
+COPY package*.json ./
 
-# Copy dependency list first (for better Docker caching)
-COPY requirements.txt /app/
+# Install dependencies (no cache for smaller image)
+RUN npm install --omit=dev
 
-# Install dependencies
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+# Copy the rest of your code
+COPY . .
 
-# Copy the rest of the project files
-COPY main.py /app/
+# Expose port if you run a health server (optional)
+EXPOSE 3000
 
 # Run the bot
-CMD ["python", "main.py"]
+CMD ["node", "main.js"]
