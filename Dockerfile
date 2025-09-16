@@ -1,20 +1,17 @@
-# Use an official Node.js LTS image (stable for production)
+# Use lightweight Node.js image
 FROM node:20-alpine
 
 # Set working directory
 WORKDIR /app
 
-# Copy package files first (better layer caching)
+# Copy dependency list first for better caching
 COPY package*.json ./
 
-# Install dependencies (no cache for smaller image)
+# Install only production dependencies
 RUN npm install --omit=dev
 
-# Copy the rest of your code
+# Copy the rest of the project files
 COPY . .
-
-# Expose port if you run a health server (optional)
-EXPOSE 3000
 
 # Run the bot
 CMD ["node", "main.js"]
