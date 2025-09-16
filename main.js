@@ -21,17 +21,16 @@ let lastPinnedId = null;
 
 async function fetchPools() {
   try {
-    // primary: trending pools
-    const url = `${GT_BASE}/networks/${GECKO_NETWORK}/trending_pools?duration=24h&page[size]=50&include=base_token,quote_token`;
+    const url = `${GT_BASE}/networks/${GECKO_NETWORK}/trending_pools?duration=24h&page[size]=50`;
     const { data } = await axios.get(url, { headers: HEADERS });
     if (data?.data?.length) return data.data;
 
     console.warn('[TrendingBot] No trending pools returned, falling back to /pools');
-    const fallbackUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/pools?sort=-reserve_usd&page[size]=50&include=base_token,quote_token`;
+    const fallbackUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/pools?page[size]=50&sort=-reserve_usd`;
     const { data: fb } = await axios.get(fallbackUrl, { headers: HEADERS });
     return fb?.data || [];
   } catch (e) {
-    console.error('[TrendingBot] Failed to fetch pools:', e.message);
+    console.error('[TrendingBot] Failed to fetch pools:', e.response?.status || e.message);
     return [];
   }
 }
@@ -110,7 +109,6 @@ async function postTrending() {
   try {
     const trending = await computeTrending();
 
-    // auto delete + unpin old
     if (lastPinnedId) {
       await bot.unpinAllChatMessages(TELEGRAM_CHAT_ID).catch(() => {});
       await bot.deleteMessage(TELEGRAM_CHAT_ID, lastPinnedId).catch(() => {});
