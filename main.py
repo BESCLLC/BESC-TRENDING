@@ -3,7 +3,7 @@ import time
 import json
 import requests
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Tuple, List
 
 # ---------- CONFIG ----------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -24,7 +24,6 @@ if not BOT_TOKEN or not CHAT_ID:
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 GECKO_BASE = "https://api.geckoterminal.com/api/v2"
 GECKO_HEADERS = {"accept": "application/json; version=20230302"}
-
 STATE_FILE = "state.json"
 state = {"last_trending_id": None}
 
@@ -93,44 +92,43 @@ def number_emoji(n: int) -> str:
     return mapping.get(n, f"{n}.")
 
 def extract_pair(pool, included):
-    # Match base_token and quote_token from the "included" array
-    base_id = pool["relationships"]["base_token"]["data"]["id"]
-    quote_id = pool["relationships"]["quote_token"]["data"]["id"]
-
-    base_token = next((i for i in included if i["id"] == base_id), None)
-    quote_token = next((i for i in included if i["id"] == quote_id), None)
-
-    base_symbol = base_token["attributes"]["symbol"] if base_token else "?"
-    quote_symbol = quote_token["attributes"]["symbol"] if quote_token else "?"
-    return f"{base_symbol}/{quote_symbol}"
-
-# ---------- FETCH + LOGIC ----------
-def fetch_trending(slug: str, size: int = 50):
     try:
-        url = f"{GECKO_BASE}/networks/{slug}/trending_pools?duration=5m&page[size]={size}&include=base_token,quote_token"
+        base_id = pool["relationships"]["base_token"]["data"]["id"]
+        quote_id = pool["relationships"]["quote_token"]["data"]["id"]
+        base_token = next((i for i in included if i["id"] == base_id), None)
+        quote_token = next((i for i in included if i["id"] == quote_id), None)
+        base_symbol = base_token["attributes"]["symbol"] if base_token else "?"
+        quote_symbol = quote_token["attributes"]["symbol"] if quote_token else "?"
+        return f"{base_symbol}/{quote_symbol}"
+    except:
+        return "Unknown/Pair"
+
+# ---------- FETCH ----------
+def fetch_trending(slug: str, duration="5m", size: int = 50) -> Tuple[List, List]:
+    try:
+        url = f"{GECKO_BASE}/networks/{slug}/trending_pools?duration={duration}&page[size]={size}&include=base_token,quote_token"
         r = requests.get(url, headers=GECKO_HEADERS, timeout=20)
         r.raise_for_status()
         data = r.json()
         return data.get("data", []), data.get("included", [])
     except Exception as e:
-        print("⚠️ Failed to fetch pools:", e)
+        print(f"⚠️ Failed to fetch pools ({duration}):", e)
         return [], []
 
-# ---------- FORMATTER ----------
+# ---------- FORMAT ----------
 def format_trending(slug, pools, included, top_n):
     if not pools:
-        return "😴 <b>No trending pools right now</b>\n🕒 Check back soon!"
-    lines = ["🔥 <b>BESC Hyperchain — Top Trending</b>", f"🕒 Last 5 min snapshot\n"]
+        return "😴 <b>No trending pools right now</b>\n🕒 Chain is quiet — check back soon!"
+    lines = [f"🔥 <b>{slug.upper()} — Top {top_n} Trending</b>", f"🕒 Snapshot: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"]
     for i, p in enumerate(pools[:top_n], 1):
         a = p.get("attributes", {})
         name = extract_pair(p, included)
         vol = safe_float((a.get("volume_usd") or {}).get("h24"))
         liq = safe_float(a.get("reserve_in_usd"))
-        link = f"https://www.geckoterminal.com/{slug}/pools/{p['id']}"
         lines.append(
             f"{number_emoji(i)} <b>{name}</b>\n"
             f"💵 24h Vol: {fmt_usd(vol)} | 💧 Liq: {fmt_usd(liq)}\n"
-            f"<a href='{link}'>View</a>\n"
+            f"<a href='https://www.geckoterminal.com/{slug}/pools/{p['id']}'>View Pool</a>\n"
         )
     lines.append(f"<a href='https://www.geckoterminal.com/{slug}/pools'>View All Pools</a>")
     return "\n".join(lines)
@@ -155,7 +153,11 @@ def main():
         now = datetime.now(timezone.utc)
         if now >= next_trending:
             print(f"⏱ Checking trending at {now.isoformat()} UTC")
-            pools, included = fetch_trending(slug)
+            pools, included = fetch_trending(slug, "5m")
+            if not pools:
+                pools, included = fetch_trending(slug, "1h")
+            if not pools:
+                pools, included = fetch_trending(slug, "24h")
 
             tg_delete(state.get("last_trending_id"))
             tg_unpin_all()
