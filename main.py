@@ -8,10 +8,9 @@ from typing import Optional
 # ---------- CONFIG ----------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-FORCED_SLUG = os.environ.get("NETWORK_SLUG", "").strip()
+FORCED_SLUG = os.environ.get("NETWORK_SLUG", "besc-hyperchain").strip()
 TRENDING_SIZE = int(os.environ.get("TRENDING_SIZE", "5"))
-GAINERS_SIZE = int(os.environ.get("GAINERS_SIZE", "5"))
-OFFSET_MIN = int(os.environ.get("OFFSET_MIN", "2"))
+CHECK_MINUTES = 5
 
 print("🔎 Debug: Container launched.")
 print("BOT_TOKEN present:", bool(BOT_TOKEN))
@@ -25,81 +24,61 @@ if not BOT_TOKEN or not CHAT_ID:
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 GECKO_BASE = "https://api.geckoterminal.com/api/v2"
-GECKO_HEADERS = {"accept": "application/json; version=20230302"}
+HEADERS = {"accept": "application/json; version=20230302"}
 
 STATE_FILE = "state.json"
-state = {"last_trending_id": None, "last_gainers_id": None}
+state = {"last_trending_id": None}
 
-# ---------- UTIL ----------
+# ---------- STATE ----------
 def load_state():
     global state
     try:
         with open(STATE_FILE, "r") as f:
             state = json.load(f)
-    except Exception as e:
-        print("⚠️ Warning: Could not load state.json:", e)
+    except:
+        print("⚠️ No previous state found, starting fresh.")
 
 def save_state():
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
-    except Exception as e:
-        print("⚠️ Warning: Could not save state.json:", e)
+    except:
+        print("⚠️ Could not save state.json")
 
-def tg_call(method, data):
-    try:
-        r = requests.post(f"{TG_API}/{method}", data=data, timeout=20)
-        return r.json()
-    except Exception as e:
-        print(f"⚠️ Telegram call failed: {method} → {e}")
-        return {}
-
+# ---------- TELEGRAM ----------
 def tg_send(text: str) -> Optional[int]:
-    r = tg_call("sendMessage", {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True})
-    if not r.get("ok"):
-        print("❌ Telegram sendMessage error:", r)
-    return r.get("result", {}).get("message_id")
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    try:
+        r = requests.post(f"{TG_API}/sendMessage", data=payload, timeout=20)
+        data = r.json()
+        if not data.get("ok"):
+            print("❌ Telegram sendMessage error:", data)
+        return data["result"]["message_id"] if data.get("ok") else None
+    except Exception as e:
+        print("❌ Telegram sendMessage exception:", e)
+        return None
 
 def tg_delete(mid: Optional[int]):
     if mid:
-        tg_call("deleteMessage", {"chat_id": CHAT_ID, "message_id": mid})
+        try:
+            requests.post(f"{TG_API}/deleteMessage", data={"chat_id": CHAT_ID, "message_id": mid}, timeout=20)
+        except Exception as e:
+            print("⚠️ Could not delete message:", e)
+
+def tg_unpin_all():
+    try:
+        requests.post(f"{TG_API}/unpinAllChatMessages", data={"chat_id": CHAT_ID}, timeout=20)
+    except:
+        pass
 
 def tg_pin(mid: Optional[int]):
-    if not mid:
-        return
-    tg_call("unpinAllChatMessages", {"chat_id": CHAT_ID})
-    tg_call("pinChatMessage", {"chat_id": CHAT_ID, "message_id": mid, "disable_notification": True})
+    if mid:
+        try:
+            requests.post(f"{TG_API}/pinChatMessage", data={"chat_id": CHAT_ID, "message_id": mid, "disable_notification": True}, timeout=20)
+        except:
+            pass
 
-def discover_slug() -> Optional[str]:
-    try:
-        r = requests.get(f"{GECKO_BASE}/networks", headers=GECKO_HEADERS, timeout=20)
-        for item in r.json().get("data", []):
-            name = (item.get("attributes", {}).get("name") or "").lower()
-            nid = item.get("id")
-            if "besc" in name:
-                return nid
-    except Exception as e:
-        print("⚠️ Warning: Failed to fetch networks:", e)
-    return None
-
-def fetch_trending(slug: str, size: int = 50, duration: str = "5m"):
-    try:
-        url = f"{GECKO_BASE}/networks/{slug}/trending_pools?duration={duration}&page[size]={size}&include=base_token,quote_token"
-        print(f"🌐 Fetching trending pools: {url}")
-        r = requests.get(url, headers=GECKO_HEADERS, timeout=20)
-        if r.status_code == 400:
-            print(f"⚠️ trending_pools not supported → fallback to /pools sorted by volume")
-            url = f"{GECKO_BASE}/networks/{slug}/pools?sort=-volume_usd.h24&page[size]={size}&include=base_token,quote_token"
-            r = requests.get(url, headers=GECKO_HEADERS, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        pools = data.get("data", [])
-        print(f"📊 Gecko returned {len(pools)} pools")
-        return pools
-    except Exception as e:
-        print("⚠️ Warning: Failed to fetch pools:", e)
-        return []
-
+# ---------- HELPERS ----------
 def safe_float(x, default=0.0):
     try:
         return float(str(x).replace(",", ""))
@@ -112,71 +91,95 @@ def fmt_usd(n: float) -> str:
     return f"${n:.2f}"
 
 def number_emoji(n: int) -> str:
-    mapping = {1:"1️⃣",2:"2️⃣",3:"3️⃣",4:"4️⃣",5:"5️⃣",6:"6️⃣",7:"7️⃣",8:"8️⃣",9:"9️⃣",10:"🔟"}
+    mapping = {1:"1️⃣",2:"2️⃣",3:"3️⃣",4:"4️⃣",5:"5️⃣"}
     return mapping.get(n, f"{n}.")
 
-def extract_pair(attr):
-    t0 = attr.get("base_token", {}).get("data", {}).get("attributes", {}).get("symbol") or attr.get("token0", {}).get("symbol", "?")
-    t1 = attr.get("quote_token", {}).get("data", {}).get("attributes", {}).get("symbol") or attr.get("token1", {}).get("symbol", "?")
-    return f"{t0}/{t1}"
+def fetch_pools(slug):
+    try:
+        url = f"{GECKO_BASE}/networks/{slug}/pools?page[size]=50"
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        return r.json().get("data", [])
+    except Exception as e:
+        print("⚠️ Failed to fetch pools:", e)
+        return []
 
-def extract_price_change(attr):
-    pc = attr.get("price_change_percentage", {})
-    return safe_float(pc.get("h24", 0)) if isinstance(pc, dict) else 0
+def fetch_trades(slug, pool_id):
+    try:
+        url = f"{GECKO_BASE}/networks/{slug}/pools/{pool_id}/trades?page[size]=50"
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        return r.json().get("data", [])
+    except:
+        return []
 
-# ---------- FORMATTERS ----------
-def format_trending(slug, pools, top_n):
-    if not pools:
-        return "😴 <b>No trending pools detected</b>\n🕒 Chain is quiet right now. Check back soon!"
-    title = "🔥 <b>Top 5 — BESC Trending</b>\n"
-    lines = [title]
-    for i, p in enumerate(pools[:top_n], 1):
-        a = p.get("attributes", {})
-        name = extract_pair(a)
-        vol = safe_float((a.get("volume_usd") or {}).get("h24"))
-        link = a.get("url") or f"https://www.geckoterminal.com/{slug}/pools/{p.get('id')}"
-        lines.append(f"{number_emoji(i)} <b>{name}</b>\n💰 {fmt_usd(vol)} | <a href='{link}'>DexS</a>\n")
+def fetch_trending(slug):
+    pools = fetch_pools(slug)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+    scored = []
+
+    for p in pools:
+        attrs = p.get("attributes", {})
+        h24_vol = safe_float((attrs.get("volume_usd") or {}).get("h24"))
+        pool_id = p.get("id")
+        trades = fetch_trades(slug, pool_id)
+        recent = [t for t in trades if datetime.fromisoformat(t["attributes"]["block_timestamp"].replace("Z","+00:00")) >= cutoff]
+        if not recent: continue
+
+        short_vol = sum(safe_float(t["attributes"]["volume_in_usd"]) for t in recent)
+        first_price = safe_float(recent[0]["attributes"]["price_to_in_usd"])
+        last_price = safe_float(recent[-1]["attributes"]["price_to_in_usd"])
+        price_change = ((last_price / first_price) - 1) * 100 if first_price > 0 else 0
+        trade_count = len(recent)
+        spike = short_vol / h24_vol if h24_vol > 0 else 1.0
+        score = (short_vol * 0.5) + (abs(price_change) * 80) + (trade_count * 10) + (spike * 100)
+
+        scored.append((score, p, short_vol, price_change, trade_count, spike))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored
+
+def format_trending(slug, scored):
+    if not scored:
+        return "😴 <b>No trending pools right now</b>\n🕒 Check back in a few minutes!"
+    lines = [f"🔥 <b>{slug.upper()} — Top {TRENDING_SIZE} Trending</b>", f"🕒 Last 15 min snapshot\n"]
+    for i, (score, p, short_vol, pc, trades, spike) in enumerate(scored[:TRENDING_SIZE], 1):
+        name = p.get("attributes", {}).get("name", "Unknown")
+        link = f"https://www.geckoterminal.com/{slug}/pools/{p['id']}"
+        pc_emoji = "📈" if pc >= 0 else "📉"
+        lines.append(
+            f"{number_emoji(i)} <b>{name}</b>\n"
+            f"💵 Vol: {fmt_usd(short_vol)} | {pc_emoji} {pc:+.2f}%\n"
+            f"🧮 Trades: {trades} | 🚀 Spike: {spike*100:.1f}%\n"
+            f"<a href='{link}'>View Pool</a>\n"
+        )
     return "\n".join(lines)
 
-def next_aligned(now, offset):
+def next_aligned(now):
     total = int(now.timestamp() // 60)
-    remainder = (total - offset) % 5
-    add = (5 - remainder) % 5
-    if add == 0: add = 5
+    remainder = total % CHECK_MINUTES
+    add = (CHECK_MINUTES - remainder) % CHECK_MINUTES
+    if add == 0: add = CHECK_MINUTES
     return (now + timedelta(minutes=add)).replace(second=0, microsecond=0)
 
-# ---------- MAIN LOOP ----------
+# ---------- MAIN ----------
 def main():
     load_state()
-    tg_call("unpinAllChatMessages", {"chat_id": CHAT_ID})  # always start fresh
-    slug = FORCED_SLUG or discover_slug() or "besc-hyperchain"
+    slug = FORCED_SLUG
     print("Using slug:", slug)
-
-    now = datetime.now(timezone.utc)
-    next_trending = next_aligned(now, 0)
-    next_gainers = next_aligned(now, OFFSET_MIN)
+    next_check = next_aligned(datetime.now(timezone.utc))
 
     while True:
         now = datetime.now(timezone.utc)
-        if now >= next_trending:
-            pools = fetch_trending(slug)
+        if now >= next_check:
+            print(f"⏱ Checking trending at {now.isoformat()} UTC")
+            scored = fetch_trending(slug)
+            tg_unpin_all()  # make sure old pinned is gone
             tg_delete(state.get("last_trending_id"))
-            mid = tg_send(format_trending(slug, pools, TRENDING_SIZE))
+            mid = tg_send(format_trending(slug, scored))
             if mid:
                 tg_pin(mid)
                 state["last_trending_id"] = mid
                 save_state()
-            next_trending = next_aligned(now, 0)
-
-        if now >= next_gainers:
-            pools = fetch_trending(slug)
-            tg_delete(state.get("last_gainers_id"))
-            mid = tg_send(format_trending(slug, pools, GAINERS_SIZE))
-            if mid:
-                state["last_gainers_id"] = mid
-                save_state()
-            next_gainers = next_aligned(now, OFFSET_MIN)
-
+            next_check = next_aligned(now)
         time.sleep(5)
 
 if __name__ == "__main__":
