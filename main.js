@@ -20,15 +20,31 @@ const HEADERS = { 'Accept': 'application/json;version=20230302' };
 let lastPinnedId = null;
 
 async function fetchPools() {
-  const url = `${GT_BASE}/networks/${GECKO_NETWORK}/pools?page[size]=50`;
-  const { data } = await axios.get(url, { headers: HEADERS });
-  return data?.data || [];
+  try {
+    // primary: trending pools
+    const url = `${GT_BASE}/networks/${GECKO_NETWORK}/trending_pools?duration=24h&page[size]=50&include=base_token,quote_token`;
+    const { data } = await axios.get(url, { headers: HEADERS });
+    if (data?.data?.length) return data.data;
+
+    console.warn('[TrendingBot] No trending pools returned, falling back to /pools');
+    const fallbackUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/pools?sort=-reserve_usd&page[size]=50&include=base_token,quote_token`;
+    const { data: fb } = await axios.get(fallbackUrl, { headers: HEADERS });
+    return fb?.data || [];
+  } catch (e) {
+    console.error('[TrendingBot] Failed to fetch pools:', e.message);
+    return [];
+  }
 }
 
 async function fetchTrades(poolId) {
-  const url = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${poolId}/trades?page[size]=50`;
-  const { data } = await axios.get(url, { headers: HEADERS });
-  return data?.data || [];
+  try {
+    const url = `${GT_BASE}/networks/${GECKO_NETWORK}/pools/${poolId}/trades?page[size]=50`;
+    const { data } = await axios.get(url, { headers: HEADERS });
+    return data?.data || [];
+  } catch (e) {
+    console.warn(`[TrendingBot] Failed to fetch trades for ${poolId}:`, e.message);
+    return [];
+  }
 }
 
 function safeFloat(x) {
@@ -44,7 +60,7 @@ function fmtUsd(n) {
 
 async function computeTrending() {
   const pools = await fetchPools();
-  const cutoff = DateTime.utc().minus({ minutes: Number(POLL_INTERVAL_MINUTES) * 2 });
+  const cutoff = DateTime.utc().minus({ minutes: Number(POLL_INTERVAL_MINUTES) });
 
   const scored = [];
   for (const p of pools) {
@@ -93,10 +109,13 @@ function formatTrending(slug, trending) {
 async function postTrending() {
   try {
     const trending = await computeTrending();
+
+    // auto delete + unpin old
     if (lastPinnedId) {
       await bot.unpinAllChatMessages(TELEGRAM_CHAT_ID).catch(() => {});
       await bot.deleteMessage(TELEGRAM_CHAT_ID, lastPinnedId).catch(() => {});
     }
+
     const msg = await bot.sendMessage(TELEGRAM_CHAT_ID, formatTrending(GECKO_NETWORK, trending), {
       parse_mode: 'HTML',
       disable_web_page_preview: true
