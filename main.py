@@ -55,6 +55,16 @@ def tg_delete(mid: Optional[int]):
         except:
             pass
 
+def tg_pin(mid: Optional[int]):
+    """Pin the latest trending message (unpin others)."""
+    if not mid:
+        return
+    try:
+        requests.post(f"{TG_API}/unpinAllChatMessages", data={"chat_id": CHAT_ID}, timeout=20)
+        requests.post(f"{TG_API}/pinChatMessage", data={"chat_id": CHAT_ID, "message_id": mid, "disable_notification": True}, timeout=20)
+    except:
+        pass
+
 def discover_slug() -> Optional[str]:
     try:
         r = requests.get(f"{GECKO_BASE}/networks", headers=GECKO_HEADERS, timeout=20)
@@ -162,6 +172,7 @@ def main():
                 tg_delete(state.get("last_trending_id"))
                 mid = tg_send(format_trending(slug, pools, TRENDING_SIZE))
                 if mid:
+                    tg_pin(mid)  # auto-pin newest trending message
                     state["last_trending_id"] = mid
                     save_state()
             next_trending = next_aligned(now, 0)
@@ -179,4 +190,5 @@ def main():
         time.sleep(5)
 
 if __name__ == "__main__":
+    print("✅ BESC Trending Bot starting up...")
     main()
