@@ -8,46 +8,65 @@ from typing import Optional, List, Dict
 from requests.exceptions import RequestException
 from ratelimit import limits, sleep_and_retry
 
+# Configure logging with both file and console output
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()  # Output to console for Railway logs
+    ]
+)
+
 # Configuration
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 NETWORK_SLUGS = os.environ.get("NETWORK_SLUGS", "besc-hyperchain").strip().split(",")
 TRENDING_SIZE = 5  # Fixed to top 5 for clean chat
-ALERT_THRESHOLD = float(os.environ.get("ALERT_THRESHOLD", "100"))  # % price change for alerts
+ALERT_THRESHOLD = os.environ.get("ALERT_THRESHOLD", "100").strip()
 CHECK_INTERVAL_MINUTES = 5  # Update every 5 minutes
 API_CALLS_PER_MINUTE = 10  # Rate limit for GeckoTerminal API
 
 # Validate environment variables
-if not BOT_TOKEN or not CHAT_ID:
-    logging.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
-    raise SystemExit("❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+try:
+    if not BOT_TOKEN:
+        logging.error("TELEGRAM_BOT_TOKEN is missing")
+        raise SystemExit("❌ TELEGRAM_BOT_TOKEN is missing")
+    if not CHAT_ID:
+        logging.error("TELEGRAM_CHAT_ID is missing")
+        raise SystemExit("❌ TELEGRAM_CHAT_ID is missing")
+    ALERT_THRESHOLD = float(ALERT_THRESHOLD)
+    logging.info("Environment variables validated successfully")
+    logging.info(f"Networks: {', '.join(NETWORK_SLUGS)}")
+    logging.info(f"Alert threshold: {ALERT_THRESHOLD}%")
+except ValueError as e:
+    logging.error(f"Invalid ALERT_THRESHOLD: {ALERT_THRESHOLD}")
+    raise SystemExit(f"❌ Invalid ALERT_THRESHOLD: {ALERT_THRESHOLD}")
 
 # API Endpoints
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 GECKO_BASE = "https://api.geckoterminal.com/api/v2"
 GECKO_HEADERS = {"accept": "application/json; version=20230302"}
 
-# State and Logging
+# State
 STATE_FILE = "state.json"
 state = {"last_trending_id": {}, "alerted_pools": {}}
-logging.basicConfig(
-    level=logging.INFO,
-    filename="bot.log",
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
 
 def load_state():
     global state
     try:
         with open(STATE_FILE, "r") as f:
             state = json.load(f)
+        logging.info("Loaded state.json successfully")
     except Exception as e:
-        logging.warning(f"Could not load state.json: {e}")
+        logging.warning(f"Could not load state.json: {e}. Using default state")
+        state = {"last_trending_id": {}, "alerted_pools": {}}
 
 def save_state():
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
+        logging.info("Saved state.json successfully")
     except Exception as e:
         logging.warning(f"Could not save state.json: {e}")
 
@@ -74,7 +93,10 @@ def tg_send(text: str, parse_mode: str = "HTML") -> Optional[int]:
         data = fetch_with_retry(f"{TG_API}/sendMessage", headers={}, method="POST", data=payload)
         if not data.get("ok"):
             logging.error(f"Telegram sendMessage error: {data}")
-        return data["result"]["message_id"] if data.get("ok") else None
+            return None
+        message_id = data["result"]["message_id"]
+        logging.info(f"Sent Telegram message: {message_id}")
+        return message_id
     except Exception as e:
         logging.error(f"Telegram sendMessage exception: {e}")
         return None
@@ -83,8 +105,9 @@ def tg_delete(mid: Optional[int]):
     if mid:
         try:
             fetch_with_retry(f"{TG_API}/deleteMessage", headers={}, method="POST", data={"chat_id": CHAT_ID, "message_id": mid})
+            logging.info(f"Deleted Telegram message: {mid}")
         except Exception as e:
-            logging.warning(f"Failed to delete Telegram message: {e}")
+            logging.warning(f"Failed to delete Telegram message {mid}: {e}")
 
 def tg_pin(mid: Optional[int]):
     if not mid:
@@ -92,8 +115,9 @@ def tg_pin(mid: Optional[int]):
     try:
         fetch_with_retry(f"{TG_API}/unpinAllChatMessages", headers={}, method="POST", data={"chat_id": CHAT_ID})
         fetch_with_retry(f"{TG_API}/pinChatMessage", headers={}, method="POST", data={"chat_id": CHAT_ID, "message_id": mid, "disable_notification": True})
+        logging.info(f"Pinned Telegram message: {mid}")
     except Exception as e:
-        logging.warning(f"Failed to pin Telegram message: {e}")
+        logging.warning(f"Failed to pin Telegram message {mid}: {e}")
 
 def safe_float(x, default=0.0) -> float:
     try:
@@ -131,6 +155,7 @@ def extract_pair(attr: dict) -> str:
 
 def fetch_trending(slug: str, size: int = 50) -> List[tuple]:
     try:
+        logging.info(f"Fetching trending pools for {slug}")
         url = f"{GECKO_BASE}/networks/{slug}/pools?sort=-volume_usd.h24&page[size]={size}&include=token0%2Ctoken1"
         data = fetch_with_retry(url, GECKO_HEADERS)
         pools = data.get("data", [])
@@ -185,6 +210,7 @@ def fetch_trending(slug: str, size: int = 50) -> List[tuple]:
             ))
 
         trend_list.sort(key=lambda x: x[0], reverse=True)
+        logging.info(f"Fetched {len(trend_list)} trending pools for {slug}")
         return trend_list[:TRENDING_SIZE]  # Limit to top 5
     except Exception as e:
         logging.error(f"Error in fetch_trending for {slug}: {e}")
@@ -210,6 +236,7 @@ def send_alert(slug: str, pool: Dict, price_change_24h: float, h24_vol: float, l
     if mid:
         state.setdefault("alerted_pools", {}).setdefault(slug, {})[pool_id] = datetime.now(timezone.utc).isoformat()
         save_state()
+        logging.info(f"Sent alert for {name} on {slug}: {price_change_24h:+.2f}%")
 
 def format_trending(slug: str, trend_list: List[tuple]) -> str:
     lines = [f"🔥 <b>{slug.upper()} — Top 5 Trending Tokens</b>", f"🕒 Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
@@ -238,42 +265,52 @@ def next_aligned(now: datetime) -> datetime:
     return (now + timedelta(minutes=add)).replace(second=0, microsecond=0)
 
 def main():
-    load_state()
     logging.info("✅ BESC Trending Bot starting up...")
-    logging.info(f"Networks: {', '.join(NETWORK_SLUGS)}")
+    try:
+        load_state()
+    except Exception as e:
+        logging.error(f"Failed to load state: {e}. Continuing with default state")
     next_trending = next_aligned(datetime.now(timezone.utc))
 
     while True:
-        now = datetime.now(timezone.utc)
-        if now >= next_trending:
-            logging.info(f"⏱ Checking trending at {now.isoformat()} UTC")
-            for slug in NETWORK_SLUGS:
-                trend_list = fetch_trending(slug)
-                if trend_list:
-                    # Send alerts for significant price changes
-                    for _, p, _, _, _, pc_24h, _, _, _, _, _, pool_age in trend_list:
-                        if abs(pc_24h) >= ALERT_THRESHOLD:
-                            a = p.get("attributes", {})
-                            h24_vol = safe_float((a.get("volume_usd") or {}).get("h24"))
-                            link = a.get("url") or f"https://www.geckoterminal.com/{slug}/pools/{p.get('id')}"
-                            send_alert(slug, p, pc_24h, h24_vol, link, pool_age)
+        try:
+            now = datetime.now(timezone.utc)
+            if now >= next_trending:
+                logging.info(f"⏱ Checking trending at {now.isoformat()} UTC")
+                for slug in NETWORK_SLUGS:
+                    trend_list = fetch_trending(slug)
+                    if trend_list:
+                        # Send alerts for significant price changes
+                        for _, p, _, _, _, pc_24h, _, _, _, _, _, pool_age in trend_list:
+                            if abs(pc_24h) >= ALERT_THRESHOLD:
+                                a = p.get("attributes", {})
+                                h24_vol = safe_float((a.get("volume_usd") or {}).get("h24"))
+                                link = a.get("url") or f"https://www.geckoterminal.com/{slug}/pools/{p.get('id')}"
+                                send_alert(slug, p, pc_24h, h24_vol, link, pool_age)
 
-                    # Post top 5 trending pools
-                    last_mid = state.get("last_trending_id", {}).get(slug)
-                    tg_delete(last_mid)
-                    text = format_trending(slug, trend_list)
-                    mid = tg_send(text)
-                    if mid:
-                        tg_pin(mid)
-                        state.setdefault("last_trending_id", {})[slug] = mid
-                        save_state()
+                        # Post top 5 trending pools
+                        last_mid = state.get("last_trending_id", {}).get(slug)
+                        tg_delete(last_mid)
+                        text = format_trending(slug, trend_list)
+                        mid = tg_send(text)
+                        if mid:
+                            tg_pin(mid)
+                            state.setdefault("last_trending_id", {})[slug] = mid
+                            save_state()
+                        else:
+                            logging.error(f"Failed to send trending message for {slug}")
                     else:
-                        logging.error(f"Failed to send trending message for {slug}")
-                else:
-                    logging.warning(f"No active pools found for {slug} in last 10 min")
-            next_trending = next_aligned(now)
-        sleep_seconds = (next_trending - now).total_seconds()
-        time.sleep(max(sleep_seconds, 1))
+                        logging.warning(f"No active pools found for {slug} in last 10 min")
+                next_trending = next_aligned(now)
+            sleep_seconds = (next_trending - now).total_seconds()
+            time.sleep(max(sleep_seconds, 1))
+        except Exception as e:
+            logging.error(f"Main loop error: {e}. Retrying in 60 seconds")
+            time.sleep(60)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logging.critical(f"Bot crashed: {e}")
+        raise
