@@ -6,7 +6,7 @@ import { DateTime } from 'luxon';
 const {
   TELEGRAM_TOKEN,
   TELEGRAM_CHAT_ID,
-  POLL_INTERVAL_MINUTES = '5',
+  POLL_INTERVAL_MINUTES = '60',
   TRENDING_SIZE = '5',
   HYPERCHARTS_BASE = 'https://api.beschypercharts.com'
 } = process.env;
