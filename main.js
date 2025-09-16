@@ -26,29 +26,26 @@ function fmtUsd(n) {
 
 async function fetchPairs() {
   try {
-    const { data } = await axios.get(`${HYPERCHARTS_BASE}/token/pairs/all`, { timeout: 20000 });
+    const { data } = await axios.get(`${HYPERCHARTS_BASE}/token/pairs/all`, { timeout: 15000 });
     const pairs = data?.data || data?.success?.data || [];
-    return pairs.filter(p => (p.liquidityUsd ?? 0) > 0).slice(0, 30); // limit to top 30 by liquidity
+    return pairs.filter(p => (p.liquidityUsd ?? 0) > 0)
+      .sort((a, b) => (b.liquidityUsd ?? 0) - (a.liquidityUsd ?? 0))
+      .slice(0, 30);
   } catch (e) {
     console.error('[TrendingBot] Failed to fetch pairs:', e.message);
     return [];
   }
 }
 
-async function fetchTokenTxs(tokenAddr) {
+async function fetchTxsForToken(tokenAddr) {
   try {
     const from = Math.floor(DateTime.utc().minus({ minutes: Number(POLL_INTERVAL_MINUTES) }).toSeconds());
     const to = Math.floor(DateTime.utc().toSeconds());
-    const url = `${HYPERCHARTS_BASE}/token/info/${tokenAddr}`;
-    const { data } = await axios.get(url, { timeout: 20000 });
-
-    const txs = data?.data?.transactions || [];
-    const recent = txs.filter(t => t.time >= from && t.time <= to);
-    const volume = recent.reduce((sum, t) => sum + Number(t.amountIn || 0), 0);
-    return { txs: recent.length, volume };
-  } catch (e) {
-    console.warn(`[TrendingBot] Failed to fetch token info for ${tokenAddr}:`, e.message);
-    return { txs: 0, volume: 0 };
+    const url = `${HYPERCHARTS_BASE}/transactions/${tokenAddr}?from=${from}&to=${to}`;
+    const { data } = await axios.get(url, { timeout: 15000 });
+    return data?.data || [];
+  } catch {
+    return [];
   }
 }
 
@@ -57,26 +54,28 @@ async function computeTrending() {
   const scored = [];
 
   for (const p of pairs) {
-    // Decide which token to scan: pick token0 unless it's WBESC/BUSDC then scan token1
-    const scanToken = p.token0?.contract?.toLowerCase().includes('33e22f') ||
-                      p.token0?.symbol === 'WBESC'
-      ? p.token1.contract
-      : p.token0.contract;
+    const token = p.token0?.contract;
+    if (!token) continue;
 
-    const { txs, volume } = await fetchTokenTxs(scanToken);
+    const txs = await fetchTxsForToken(token);
+    if (!txs.length) continue;
 
-    if (txs === 0) continue; // skip dead pairs
+    const volume = txs.reduce((sum, t) => {
+      const vIn = Number(t.amountIn || 0);
+      const vOut = Number(t.amountOut || 0);
+      return sum + vIn + vOut;
+    }, 0);
 
-    const score = (volume * 0.5) + (txs * 20) + ((p.liquidityUsd || 0) * 0.0001);
-    scored.push({ ...p, txs, volume, score });
+    if (volume <= 0) continue; // skip useless pairs
+
+    const score = (volume * 0.5) + (txs.length * 20) + ((p.liquidityUsd || 0) * 0.0001);
+    scored.push({ ...p, txs: txs.length, volume, score });
   }
 
   scored.sort((a, b) => b.score - a.score);
 
-  // fallback: if none have txs, just return top liquidity pairs
   if (!scored.length) {
-    const fallback = pairs.sort((a, b) => (b.liquidityUsd ?? 0) - (a.liquidityUsd ?? 0))
-      .slice(0, Number(TRENDING_SIZE))
+    const fallback = pairs.slice(0, Number(TRENDING_SIZE))
       .map(p => ({ ...p, txs: p.transactions24h ?? 0, volume: 0, score: 0 }));
     return { trending: fallback, isFallback: true };
   }
@@ -89,11 +88,11 @@ function formatTrending({ trending, isFallback }) {
     return '😴 <b>No trending pairs right now</b>\n🕒 Check back later!';
   }
 
-  const header = isFallback
+  const title = isFallback
     ? `💤 <b>BESC HyperChain — Quiet Market</b>\n📊 Showing top pairs by liquidity:`
     : `🔥 <b>BESC HyperChain — Top ${trending.length} Trending</b>\n🕒 Last ${POLL_INTERVAL_MINUTES} min snapshot`;
 
-  const lines = [header, ''];
+  const lines = [title, ''];
 
   trending.forEach((p, i) => {
     const t0 = p.token0.symbol || '?';
