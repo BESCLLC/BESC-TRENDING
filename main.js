@@ -21,16 +21,11 @@ let lastPinnedId = null;
 
 async function fetchPools() {
   try {
-    const url = `${GT_BASE}/networks/${GECKO_NETWORK}/trending_pools?duration=24h&page[size]=50`;
+    const url = `${GT_BASE}/networks/${GECKO_NETWORK}/pools?page[size]=50&sort=-reserve_usd`;
     const { data } = await axios.get(url, { headers: HEADERS });
-    if (data?.data?.length) return data.data;
-
-    console.warn('[TrendingBot] No trending pools returned, falling back to /pools');
-    const fallbackUrl = `${GT_BASE}/networks/${GECKO_NETWORK}/pools?page[size]=50&sort=-reserve_usd`;
-    const { data: fb } = await axios.get(fallbackUrl, { headers: HEADERS });
-    return fb?.data || [];
+    return data?.data || [];
   } catch (e) {
-    console.error('[TrendingBot] Failed to fetch pools:', e.response?.status || e.message);
+    console.error('[TrendingBot] Pool fetch failed:', e.response?.status || e.message);
     return [];
   }
 }
@@ -41,7 +36,7 @@ async function fetchTrades(poolId) {
     const { data } = await axios.get(url, { headers: HEADERS });
     return data?.data || [];
   } catch (e) {
-    console.warn(`[TrendingBot] Failed to fetch trades for ${poolId}:`, e.message);
+    console.warn(`[TrendingBot] Trades fetch failed for ${poolId}:`, e.message);
     return [];
   }
 }
@@ -108,12 +103,10 @@ function formatTrending(slug, trending) {
 async function postTrending() {
   try {
     const trending = await computeTrending();
-
     if (lastPinnedId) {
       await bot.unpinAllChatMessages(TELEGRAM_CHAT_ID).catch(() => {});
       await bot.deleteMessage(TELEGRAM_CHAT_ID, lastPinnedId).catch(() => {});
     }
-
     const msg = await bot.sendMessage(TELEGRAM_CHAT_ID, formatTrending(GECKO_NETWORK, trending), {
       parse_mode: 'HTML',
       disable_web_page_preview: true
@@ -121,7 +114,7 @@ async function postTrending() {
     await bot.pinChatMessage(TELEGRAM_CHAT_ID, msg.message_id, { disable_notification: true });
     lastPinnedId = msg.message_id;
   } catch (e) {
-    console.error('[TrendingBot] Failed to post trending:', e.message);
+    console.error('[TrendingBot] Post failed:', e.message);
   }
 }
 
