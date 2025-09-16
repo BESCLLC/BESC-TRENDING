@@ -8,7 +8,8 @@ const {
   TELEGRAM_CHAT_ID,
   POLL_INTERVAL_MINUTES = '60',
   TRENDING_SIZE = '5',
-  HYPERCHARTS_BASE = 'https://api.beschypercharts.com'
+  HYPERCHARTS_BASE = 'https://api.beschypercharts.com',
+  GECKO_NETWORK_SLUG = 'besc-hyperchain'
 } = process.env;
 
 if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
@@ -47,7 +48,7 @@ async function computeTrending() {
   const pairs = await fetchPairs();
   const cutoff = DateTime.utc().minus({ minutes: Number(POLL_INTERVAL_MINUTES) });
 
-  // 🔥 Fetch all token infos in parallel
+  // Fetch token info for all pairs in parallel
   const tokenInfos = await Promise.all(
     pairs.map(p => fetchTokenInfo(p.token0.contract))
   );
@@ -95,11 +96,13 @@ function formatTrending({ trending, isFallback }) {
   trending.forEach((x, i) => {
     const t0 = x.pair.token0.symbol || '?';
     const t1 = x.pair.token1.symbol || '?';
+    const link = `https://www.geckoterminal.com/${GECKO_NETWORK_SLUG}/pools/${x.pair.pair}`;
+
     lines.push(
       `${i + 1}️⃣ <b>${t0}/${t1}</b>\n` +
       `💵 Vol: ${fmtUsd(x.vol)} | 🧮 Tx: ${x.txCount}\n` +
       `💧 LQ: ${fmtUsd(x.pair.liquidityUsd)}\n` +
-      `<a href="https://beschypercharts.com/pair/${x.pair.pair}">View Pair</a>\n`
+      `<a href="${link}">View Pair</a>\n`
     );
   });
 
