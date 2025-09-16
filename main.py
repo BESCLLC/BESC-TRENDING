@@ -56,7 +56,11 @@ def tg_send(text: str) -> Optional[int]:
         print("❌ Telegram sendMessage exception:", e)
         return None
 
-def tg_delete(mid: Optional[int]):
+def tg_delete_and_unpin(mid: Optional[int]):
+    try:
+        requests.post(f"{TG_API}/unpinAllChatMessages", data={"chat_id": CHAT_ID}, timeout=20)
+    except:
+        pass
     if mid:
         try:
             requests.post(f"{TG_API}/deleteMessage", data={"chat_id": CHAT_ID, "message_id": mid}, timeout=20)
@@ -67,7 +71,6 @@ def tg_pin(mid: Optional[int]):
     if not mid:
         return
     try:
-        requests.post(f"{TG_API}/unpinAllChatMessages", data={"chat_id": CHAT_ID}, timeout=20)
         requests.post(f"{TG_API}/pinChatMessage", data={"chat_id": CHAT_ID, "message_id": mid, "disable_notification": True}, timeout=20)
     except:
         pass
@@ -97,12 +100,10 @@ def extract_pair(attr):
 # ---------- TRENDING FETCH ----------
 def fetch_trending(slug: str, size: int = 50):
     try:
-        url = f"{GECKO_BASE}/networks/{slug}/pools?page[size]={size}&include=token0,token1"
+        url = f"{GECKO_BASE}/networks/{slug}/pools?page[size]={size}"
         r = requests.get(url, headers=GECKO_HEADERS, timeout=20)
         r.raise_for_status()
         pools = r.json().get("data", [])
-
-        # Local sort by 24h volume
         pools.sort(key=lambda p: safe_float((p.get("attributes", {}).get("volume_usd") or {}).get("h24")), reverse=True)
 
         trend_list = []
@@ -117,22 +118,22 @@ def fetch_trending(slug: str, size: int = 50):
             t = requests.get(trades_url, headers=GECKO_HEADERS, timeout=20)
             trades = t.json().get("data", [])
 
-            recent_trades = [tr for tr in trades if datetime.fromisoformat(
-                tr["attributes"]["timestamp"].replace("Z", "+00:00")) >= cutoff] if trades else []
+            recent_trades = [
+                tr for tr in trades
+                if datetime.fromisoformat(tr["attributes"]["block_timestamp"].replace("Z", "+00:00")) >= cutoff
+            ] if trades else []
 
-            short_vol = sum(float(tr["attributes"]["trade_amount_usd"]) for tr in recent_trades)
+            short_vol = sum(safe_float(tr["attributes"]["volume_in_usd"]) for tr in recent_trades)
             trade_count = len(recent_trades)
 
             if recent_trades:
-                first_price = float(recent_trades[0]["attributes"]["price_usd"])
-                last_price = float(recent_trades[-1]["attributes"]["price_usd"])
+                first_price = safe_float(recent_trades[0]["attributes"]["price_to_in_usd"])
+                last_price = safe_float(recent_trades[-1]["attributes"]["price_to_in_usd"])
                 price_change = ((last_price / first_price) - 1) * 100 if first_price > 0 else 0
             else:
-                price_change = 0  # fallback if no trades
+                price_change = 0
 
             spike_ratio = short_vol / h24_vol if h24_vol > 0 else 0.01
-
-            # Scoring to rank trending
             score = (short_vol * 0.5) + (abs(price_change) * 100) + (trade_count * 20) + (spike_ratio * 200) + (h24_vol * 0.01)
             trend_list.append((score, p, short_vol, price_change, trade_count, spike_ratio))
 
@@ -146,7 +147,7 @@ def fetch_trending(slug: str, size: int = 50):
 def format_trending(slug, trend_list, top_n):
     lines = ["🔥 <b>BESC Hyperchain — Live Trending</b>", "🕒 Last 10 min snapshot\n"]
     if not trend_list:
-        lines.append("😴 <i>No trending pools detected — everyone’s asleep on-chain.</i>\n🕒 Check back in a few minutes!")
+        lines.append("😴 <i>No trending pools detected — everyone's asleep on-chain.</i>\n🕒 Check back soon!")
         return "\n".join(lines)
 
     for i, (score, p, short_vol, price_change, trade_count, spike_ratio) in enumerate(trend_list[:top_n], 1):
@@ -185,7 +186,7 @@ def main():
         if now >= next_trending:
             print(f"⏱ Checking trending at {now.isoformat()} UTC")
             trend_list = fetch_trending(slug)
-            tg_delete(state.get("last_trending_id"))
+            tg_delete_and_unpin(state.get("last_trending_id"))
             mid = tg_send(format_trending(slug, trend_list, TRENDING_SIZE))
             if mid:
                 tg_pin(mid)
