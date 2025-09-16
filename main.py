@@ -1,4 +1,3 @@
-
 import os
 import time
 import json
@@ -57,16 +56,18 @@ def tg_send(text: str) -> Optional[int]:
         print("❌ Telegram sendMessage exception:", e)
         return None
 
-def tg_delete_and_unpin(mid: Optional[int]):
-    try:
-        requests.post(f"{TG_API}/unpinAllChatMessages", data={"chat_id": CHAT_ID}, timeout=20)
-    except:
-        pass
+def tg_delete(mid: Optional[int]):
     if mid:
         try:
             requests.post(f"{TG_API}/deleteMessage", data={"chat_id": CHAT_ID, "message_id": mid}, timeout=20)
         except:
             pass
+
+def tg_unpin_all():
+    try:
+        requests.post(f"{TG_API}/unpinAllChatMessages", data={"chat_id": CHAT_ID}, timeout=20)
+    except:
+        pass
 
 def tg_pin(mid: Optional[int]):
     if not mid:
@@ -83,81 +84,52 @@ def safe_float(x, default=0.0):
         return default
 
 def fmt_usd(n: float) -> str:
-    if n >= 1_000_000:
-        return f"${n/1_000_000:.2f}M"
-    if n >= 1_000:
-        return f"${n/1_000:.2f}K"
+    if n >= 1_000_000: return f"${n/1_000_000:.2f}M"
+    if n >= 1_000: return f"${n/1_000:.2f}K"
     return f"${n:.2f}"
 
 def number_emoji(n: int) -> str:
     mapping = {1:"1️⃣",2:"2️⃣",3:"3️⃣",4:"4️⃣",5:"5️⃣"}
     return mapping.get(n, f"{n}.")
 
-def extract_pair(attr):
-    t0 = attr.get("token0", {}).get("symbol","?")
-    t1 = attr.get("token1", {}).get("symbol","?")
-    return f"{t0}/{t1}"
+def extract_pair(pool, included):
+    # Match base_token and quote_token from the "included" array
+    base_id = pool["relationships"]["base_token"]["data"]["id"]
+    quote_id = pool["relationships"]["quote_token"]["data"]["id"]
 
-# ---------- TRENDING FETCH ----------
-def fetch_trending(slug: str, size: int = 50, lookback_minutes: int = 10):
+    base_token = next((i for i in included if i["id"] == base_id), None)
+    quote_token = next((i for i in included if i["id"] == quote_id), None)
+
+    base_symbol = base_token["attributes"]["symbol"] if base_token else "?"
+    quote_symbol = quote_token["attributes"]["symbol"] if quote_token else "?"
+    return f"{base_symbol}/{quote_symbol}"
+
+# ---------- FETCH + LOGIC ----------
+def fetch_trending(slug: str, size: int = 50):
     try:
-        url = f"{GECKO_BASE}/networks/{slug}/pools?sort=-volume_usd.h24&page[size]={size}"
+        url = f"{GECKO_BASE}/networks/{slug}/trending_pools?duration=5m&page[size]={size}&include=base_token,quote_token"
         r = requests.get(url, headers=GECKO_HEADERS, timeout=20)
         r.raise_for_status()
-        pools = r.json().get("data", [])
-        trend_list = []
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
-
-        for p in pools:
-            attrs = p.get("attributes", {})
-            h24_vol = safe_float((attrs.get("volume_usd") or {}).get("h24"))
-            pool_id = p.get("id")
-
-            trades_url = f"{GECKO_BASE}/networks/{slug}/pools/{pool_id}/trades"
-            t = requests.get(trades_url, headers=GECKO_HEADERS, timeout=20)
-            trades = t.json().get("data", [])
-            if not trades:
-                continue
-
-            recent_trades = [
-                tr for tr in trades
-                if datetime.fromisoformat(tr["attributes"]["block_timestamp"].replace("Z", "+00:00")) >= cutoff
-            ]
-            if not recent_trades:
-                continue
-
-            short_vol = sum(safe_float(tr["attributes"]["volume_in_usd"]) for tr in recent_trades)
-            first_price = safe_float(recent_trades[0]["attributes"]["price_to_in_usd"])
-            last_price = safe_float(recent_trades[-1]["attributes"]["price_to_in_usd"])
-            price_change = ((last_price / first_price) - 1) * 100 if first_price > 0 else 0
-            trade_count = len(recent_trades)
-            spike_ratio = short_vol / h24_vol if h24_vol > 0 else 0.01
-
-            score = (short_vol * 0.5) + (abs(price_change) * 100) + (trade_count * 20) + (spike_ratio * 200)
-            trend_list.append((score, p, short_vol, price_change, trade_count, spike_ratio))
-
-        trend_list.sort(key=lambda x: x[0], reverse=True)
-        return trend_list
+        data = r.json()
+        return data.get("data", []), data.get("included", [])
     except Exception as e:
         print("⚠️ Failed to fetch pools:", e)
-        return []
+        return [], []
 
-# ---------- FORMAT ----------
-def format_trending(slug, trend_list, top_n, lookback_minutes):
-    lines = [f"🔥 <b>BESC Hyperchain — Trending ({lookback_minutes}m)</b>", "🕒 Snapshot of recent trades\n"]
-    if not trend_list:
-        lines.append("😴 <i>No trading activity in the last hour.</i>\n🕒 Liquidity is quiet — check back later!")
-        return "\n".join(lines)
-
-    for i, (score, p, short_vol, price_change, trade_count, spike_ratio) in enumerate(trend_list[:top_n], 1):
+# ---------- FORMATTER ----------
+def format_trending(slug, pools, included, top_n):
+    if not pools:
+        return "😴 <b>No trending pools right now</b>\n🕒 Check back soon!"
+    lines = ["🔥 <b>BESC Hyperchain — Top Trending</b>", f"🕒 Last 5 min snapshot\n"]
+    for i, p in enumerate(pools[:top_n], 1):
         a = p.get("attributes", {})
-        name = extract_pair(a)
-        link = a.get("url") or f"https://www.geckoterminal.com/{slug}/pools/{p.get('id')}"
-        pc_emoji = "📈" if price_change >= 0 else "📉"
+        name = extract_pair(p, included)
+        vol = safe_float((a.get("volume_usd") or {}).get("h24"))
+        liq = safe_float(a.get("reserve_in_usd"))
+        link = f"https://www.geckoterminal.com/{slug}/pools/{p['id']}"
         lines.append(
             f"{number_emoji(i)} <b>{name}</b>\n"
-            f"💵 Vol: {fmt_usd(short_vol)} | {pc_emoji} {price_change:+.2f}%\n"
-            f"🧮 Trades: {trade_count} | 🚀 Spike: {spike_ratio*100:.1f}%\n"
+            f"💵 24h Vol: {fmt_usd(vol)} | 💧 Liq: {fmt_usd(liq)}\n"
             f"<a href='{link}'>View</a>\n"
         )
     lines.append(f"<a href='https://www.geckoterminal.com/{slug}/pools'>View All Pools</a>")
@@ -183,17 +155,17 @@ def main():
         now = datetime.now(timezone.utc)
         if now >= next_trending:
             print(f"⏱ Checking trending at {now.isoformat()} UTC")
-            # Progressive fallback: 10m → 30m → 60m
-            for lookback in [10, 30, 60]:
-                trend_list = fetch_trending(slug, lookback_minutes=lookback)
-                if trend_list:
-                    break
-            tg_delete_and_unpin(state.get("last_trending_id"))
-            mid = tg_send(format_trending(slug, trend_list, TRENDING_SIZE, lookback))
+            pools, included = fetch_trending(slug)
+
+            tg_delete(state.get("last_trending_id"))
+            tg_unpin_all()
+
+            mid = tg_send(format_trending(slug, pools, included, TRENDING_SIZE))
             if mid:
                 tg_pin(mid)
                 state["last_trending_id"] = mid
                 save_state()
+
             next_trending = next_aligned(now)
         time.sleep(5)
 
