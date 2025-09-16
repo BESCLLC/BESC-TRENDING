@@ -1,20 +1,21 @@
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
-import { DateTime } from 'luxon';
 
 const {
   TELEGRAM_TOKEN,
   TELEGRAM_CHAT_ID,
-  POLL_INTERVAL_MINUTES = '3',
-  TRENDING_SIZE = '5',
-  HYPERCHARTS_BASE = 'https://api.beschypercharts.com'
+  POLL_INTERVAL_MINUTES = '5',
+  TRENDING_SIZE = '5'
 } = process.env;
 
 if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
   throw new Error('Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID');
 
 const bot = new TelegramBot(TELEGRAM_TOKEN);
+const HC_BASE = 'https://api.beschypercharts.com/token/pairs/all';
+const INFO_BASE = 'https://api.beschypercharts.com/token/info';
+
 let lastPinnedId = null;
 
 function fmtUsd(n) {
@@ -26,19 +27,18 @@ function fmtUsd(n) {
 
 async function fetchPairs() {
   try {
-    const { data } = await axios.get(`${HYPERCHARTS_BASE}/token/pairs/all`, { timeout: 20000 });
-    const pairs = data?.data || data?.success?.data || [];
-    return pairs.filter(p => (p.liquidityUsd ?? 0) > 50);
+    const { data } = await axios.get(HC_BASE, { timeout: 20000 });
+    return (data?.success?.data || []).filter(p => (p.liquidityUsd ?? 0) > 50);
   } catch (e) {
     console.error('[TrendingBot] Failed to fetch pairs:', e.message);
     return [];
   }
 }
 
-async function fetchTokenInfo(tokenAddress) {
+async function fetchTokenInfo(contract) {
   try {
-    const { data } = await axios.get(`${HYPERCHARTS_BASE}/token/info/${tokenAddress}`, { timeout: 15000 });
-    return data?.data || data?.success?.data;
+    const { data } = await axios.get(`${INFO_BASE}/${contract}`, { timeout: 20000 });
+    return data?.success?.data || null;
   } catch {
     return null;
   }
@@ -46,40 +46,31 @@ async function fetchTokenInfo(tokenAddress) {
 
 async function computeTrending() {
   const pairs = await fetchPairs();
-  const cutoff = DateTime.utc().minus({ minutes: Number(POLL_INTERVAL_MINUTES) });
+  const cutoff = Math.floor(Date.now() / 1000) - (Number(POLL_INTERVAL_MINUTES) * 60);
+
   const scored = [];
-
   for (const p of pairs) {
-    // Pick token0 for info fetch
+    // Use token0 as main token to fetch transactions
     const info = await fetchTokenInfo(p.token0.contract);
-    if (!info || !info.transactions) continue;
+    if (!info?.transactions) continue;
 
-    const recent = info.transactions.filter(t =>
-      DateTime.fromSeconds(Number(t.time)).toUTC() >= cutoff
-    );
+    const recentTx = info.transactions.filter(tx => tx.time >= cutoff);
+    if (!recentTx.length) continue;
 
-    const vol = recent.reduce((sum, t) => sum + Number(t.amountIn || 0), 0);
-    const txCount = recent.length || (p.transactions24h || 0);
+    const txCount = recentTx.length;
+    const vol = recentTx.reduce((sum, tx) => sum + (Number(tx.amountIn) || 0), 0);
 
-    if (txCount === 0) continue; // skip completely dead pairs
-
-    const score =
-      vol * 0.5 +
-      txCount * 20 +
-      (p.liquidityUsd ?? 0) * 0.0001;
-
-    scored.push({ score, pair: p, vol, txCount });
-    console.log(`[TrendingBot] Pair ${p.token0.symbol}/${p.token1.symbol} — txs: ${txCount}, vol: ${vol.toFixed(4)}, score: ${score.toFixed(2)}`);
+    const score = txCount * 10 + vol * 0.1; // prioritize activity
+    scored.push({ ...p, score, txCount, vol });
   }
 
   scored.sort((a, b) => b.score - a.score);
 
-  // fallback: if nothing scored, show top by liquidity
   if (!scored.length) {
     const fallback = pairs
       .sort((a, b) => (b.liquidityUsd ?? 0) - (a.liquidityUsd ?? 0))
       .slice(0, Number(TRENDING_SIZE))
-      .map(p => ({ score: 0, pair: p, vol: 0, txCount: p.transactions24h ?? 0 }));
+      .map(p => ({ ...p, txCount: p.transactions24h || 0, vol: 0 }));
     return { trending: fallback, isFallback: true };
   }
 
@@ -88,24 +79,23 @@ async function computeTrending() {
 
 function formatTrending({ trending, isFallback }) {
   if (!trending.length) {
-    return '😴 <b>No trending pairs right now</b>\n🕒 Check back later!';
+    return '😴 <b>No trending pairs right now</b>\n🕒 Chain is completely quiet — check back later!';
   }
 
   const title = isFallback
-    ? `💤 <b>BESC HyperChain — Quiet Market</b>\n📊 Showing top pairs by liquidity:\n`
-    : `🔥 <b>BESC HyperChain — Top ${trending.length} Trending</b>\n🕒 Last ${POLL_INTERVAL_MINUTES} min snapshot\n`;
+    ? `💤 <b>BESC HyperChain — Quiet Market</b>\n📊 Showing top pairs by liquidity:`
+    : `🔥 <b>BESC HyperChain — Top ${trending.length} Trending</b>\n🕒 Last ${POLL_INTERVAL_MINUTES} min snapshot`;
 
-  const lines = [title];
+  const lines = [title, ''];
 
-  trending.forEach((x, i) => {
-    const t0 = x.pair.token0.symbol || '?';
-    const t1 = x.pair.token1.symbol || '?';
-    const link = `https://www.geckoterminal.com/besc-hyperchain/pools/${x.pair.pair}`;
+  trending.forEach((p, i) => {
+    const t0 = p.token0.symbol || '?';
+    const t1 = p.token1.symbol || '?';
     lines.push(
       `${i + 1}️⃣ <b>${t0}/${t1}</b>\n` +
-      `💵 Vol: ${fmtUsd(x.vol)} | 🧮 Tx: ${x.txCount}\n` +
-      `💧 LQ: ${fmtUsd(x.pair.liquidityUsd)}\n` +
-      `<a href="${link}">View Pair</a>\n`
+      `💵 Vol: ${fmtUsd(p.vol)} | 🧮 Tx: ${p.txCount}\n` +
+      `💧 LQ: ${fmtUsd(p.liquidityUsd)}\n` +
+      `<a href="https://www.geckoterminal.com/besc-hyperchain/pools/${p.pair}">View Pair</a>\n`
     );
   });
 
@@ -129,6 +119,7 @@ async function postTrending() {
 
     await bot.pinChatMessage(TELEGRAM_CHAT_ID, msg.message_id, { disable_notification: true });
     lastPinnedId = msg.message_id;
+
     console.log(`[TrendingBot] ✅ Posted trending (${result.trending.length} pairs)${result.isFallback ? ' [Fallback]' : ''}`);
   } catch (e) {
     console.error('[TrendingBot] Failed to post trending:', e.message);
