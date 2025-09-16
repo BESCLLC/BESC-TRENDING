@@ -1,3 +1,4 @@
+
 import os
 import time
 import json
@@ -98,16 +99,14 @@ def extract_pair(attr):
     return f"{t0}/{t1}"
 
 # ---------- TRENDING FETCH ----------
-def fetch_trending(slug: str, size: int = 50):
+def fetch_trending(slug: str, size: int = 50, lookback_minutes: int = 10):
     try:
-        url = f"{GECKO_BASE}/networks/{slug}/pools?page[size]={size}"
+        url = f"{GECKO_BASE}/networks/{slug}/pools?sort=-volume_usd.h24&page[size]={size}"
         r = requests.get(url, headers=GECKO_HEADERS, timeout=20)
         r.raise_for_status()
         pools = r.json().get("data", [])
-        pools.sort(key=lambda p: safe_float((p.get("attributes", {}).get("volume_usd") or {}).get("h24")), reverse=True)
-
         trend_list = []
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
 
         for p in pools:
             attrs = p.get("attributes", {})
@@ -117,24 +116,24 @@ def fetch_trending(slug: str, size: int = 50):
             trades_url = f"{GECKO_BASE}/networks/{slug}/pools/{pool_id}/trades"
             t = requests.get(trades_url, headers=GECKO_HEADERS, timeout=20)
             trades = t.json().get("data", [])
+            if not trades:
+                continue
 
             recent_trades = [
                 tr for tr in trades
                 if datetime.fromisoformat(tr["attributes"]["block_timestamp"].replace("Z", "+00:00")) >= cutoff
-            ] if trades else []
+            ]
+            if not recent_trades:
+                continue
 
             short_vol = sum(safe_float(tr["attributes"]["volume_in_usd"]) for tr in recent_trades)
+            first_price = safe_float(recent_trades[0]["attributes"]["price_to_in_usd"])
+            last_price = safe_float(recent_trades[-1]["attributes"]["price_to_in_usd"])
+            price_change = ((last_price / first_price) - 1) * 100 if first_price > 0 else 0
             trade_count = len(recent_trades)
-
-            if recent_trades:
-                first_price = safe_float(recent_trades[0]["attributes"]["price_to_in_usd"])
-                last_price = safe_float(recent_trades[-1]["attributes"]["price_to_in_usd"])
-                price_change = ((last_price / first_price) - 1) * 100 if first_price > 0 else 0
-            else:
-                price_change = 0
-
             spike_ratio = short_vol / h24_vol if h24_vol > 0 else 0.01
-            score = (short_vol * 0.5) + (abs(price_change) * 100) + (trade_count * 20) + (spike_ratio * 200) + (h24_vol * 0.01)
+
+            score = (short_vol * 0.5) + (abs(price_change) * 100) + (trade_count * 20) + (spike_ratio * 200)
             trend_list.append((score, p, short_vol, price_change, trade_count, spike_ratio))
 
         trend_list.sort(key=lambda x: x[0], reverse=True)
@@ -143,11 +142,11 @@ def fetch_trending(slug: str, size: int = 50):
         print("⚠️ Failed to fetch pools:", e)
         return []
 
-# ---------- FORMATTER ----------
-def format_trending(slug, trend_list, top_n):
-    lines = ["🔥 <b>BESC Hyperchain — Live Trending</b>", "🕒 Last 10 min snapshot\n"]
+# ---------- FORMAT ----------
+def format_trending(slug, trend_list, top_n, lookback_minutes):
+    lines = [f"🔥 <b>BESC Hyperchain — Trending ({lookback_minutes}m)</b>", "🕒 Snapshot of recent trades\n"]
     if not trend_list:
-        lines.append("😴 <i>No trending pools detected — everyone's asleep on-chain.</i>\n🕒 Check back soon!")
+        lines.append("😴 <i>No trading activity in the last hour.</i>\n🕒 Liquidity is quiet — check back later!")
         return "\n".join(lines)
 
     for i, (score, p, short_vol, price_change, trade_count, spike_ratio) in enumerate(trend_list[:top_n], 1):
@@ -161,16 +160,15 @@ def format_trending(slug, trend_list, top_n):
             f"🧮 Trades: {trade_count} | 🚀 Spike: {spike_ratio*100:.1f}%\n"
             f"<a href='{link}'>View</a>\n"
         )
-    lines.append("<a href='https://www.geckoterminal.com/besc-hyperchain/pools'>View All Pools</a>")
+    lines.append(f"<a href='https://www.geckoterminal.com/{slug}/pools'>View All Pools</a>")
     return "\n".join(lines)
 
-# ---------- LOOP ----------
+# ---------- MAIN LOOP ----------
 def next_aligned(now):
     total = int(now.timestamp() // 60)
     remainder = total % 5
     add = (5 - remainder) % 5
-    if add == 0:
-        add = 5
+    if add == 0: add = 5
     return (now + timedelta(minutes=add)).replace(second=0, microsecond=0)
 
 def main():
@@ -185,9 +183,13 @@ def main():
         now = datetime.now(timezone.utc)
         if now >= next_trending:
             print(f"⏱ Checking trending at {now.isoformat()} UTC")
-            trend_list = fetch_trending(slug)
+            # Progressive fallback: 10m → 30m → 60m
+            for lookback in [10, 30, 60]:
+                trend_list = fetch_trending(slug, lookback_minutes=lookback)
+                if trend_list:
+                    break
             tg_delete_and_unpin(state.get("last_trending_id"))
-            mid = tg_send(format_trending(slug, trend_list, TRENDING_SIZE))
+            mid = tg_send(format_trending(slug, trend_list, TRENDING_SIZE, lookback))
             if mid:
                 tg_pin(mid)
                 state["last_trending_id"] = mid
