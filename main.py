@@ -3,7 +3,7 @@ import time
 import json
 import requests
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 # ---------- CONFIG & DEBUG ----------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -20,6 +20,7 @@ print("FORCED_SLUG:", FORCED_SLUG)
 
 if not BOT_TOKEN or not CHAT_ID:
     print("❌ ERROR: Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+    print("Sleeping 15 seconds so logs are visible before exit...")
     time.sleep(15)
     raise SystemExit("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
 
@@ -66,6 +67,7 @@ def tg_delete(mid: Optional[int]):
             print("⚠️ Warning: Failed to delete message:", e)
 
 def tg_pin(mid: Optional[int]):
+    """Pin the latest trending message (unpin others)."""
     if not mid:
         return
     try:
@@ -86,20 +88,17 @@ def discover_slug() -> Optional[str]:
         print("⚠️ Warning: Failed to fetch networks:", e)
     return None
 
-def fetch_trending(slug: str, size: int = 50, duration: str = "5m"):
+def fetch_trending(slug: str, size: int = 50):
     try:
-        url = f"{GECKO_BASE}/networks/{slug}/trending_pools?duration={duration}&page[size]={size}"
-        print(f"🌐 Fetching trending pools: {url}")
+        url = f"{GECKO_BASE}/networks/{slug}/pools?sort=-5m_trend_score&page[size]={size}"
+        print(f"🌐 Fetching pools by trend score: {url}")
         r = requests.get(url, headers=GECKO_HEADERS, timeout=20)
         data = r.json()
         pools = data.get("data", [])
-        print(f"📊 Gecko returned {len(pools)} pools for {duration}")
-        for p in pools[:3]:  # log first 3 pools
-            a = p.get("attributes", {})
-            print(f"   • {a.get('name','?')} — Vol: {(a.get('volume_usd') or {}).get('h24')}")
+        print(f"📊 Gecko returned {len(pools)} pools sorted by trend score")
         return pools
     except Exception as e:
-        print("⚠️ Warning: Failed to fetch trending pools:", e)
+        print("⚠️ Warning: Failed to fetch pools:", e)
         return []
 
 def safe_float(x, default=0.0):
@@ -153,6 +152,7 @@ def format_gainers(slug, pools, top_n):
         vol = safe_float((a.get("volume_usd") or {}).get("h24"))
         sortable.append((pc if pc is not None else -9999.0, vol, p))
     sortable.sort(key=lambda x:(x[0],x[1]), reverse=True)
+
     title = "🚀 <b>Top 5 Gainers — BESC</b>\n"
     lines = [title]
     for i, (_,_,p) in enumerate(sortable[:top_n], 1):
@@ -193,10 +193,11 @@ def main():
                     tg_delete(state.get("last_trending_id"))
                     mid = tg_send(format_trending(slug, pools, TRENDING_SIZE))
                     if mid:
-                        print(f"📤 Sent trending message ID: {mid}")
                         tg_pin(mid)
                         state["last_trending_id"] = mid
                         save_state()
+                else:
+                    print("⚠️ No pools returned from Gecko for trending.")
                 next_trending = next_aligned(now, 0)
 
             if now >= next_gainers:
@@ -206,9 +207,10 @@ def main():
                     tg_delete(state.get("last_gainers_id"))
                     mid = tg_send(format_gainers(slug, pools, GAINERS_SIZE))
                     if mid:
-                        print(f"📤 Sent gainers message ID: {mid}")
                         state["last_gainers_id"] = mid
                         save_state()
+                else:
+                    print("⚠️ No pools returned from Gecko for gainers.")
                 next_gainers = next_aligned(now, OFFSET_MIN)
 
             time.sleep(5)
