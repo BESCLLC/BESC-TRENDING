@@ -5,6 +5,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+# --- CONFIG ---
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 FORCED_SLUG = os.environ.get("NETWORK_SLUG", "").strip()
@@ -27,6 +28,7 @@ GECKO_HEADERS = {"accept": "application/json; version=20230302"}
 STATE_FILE = "state.json"
 state = {"last_trending_id": None}
 
+# --- STATE HELPERS ---
 def load_state():
     global state
     try:
@@ -42,6 +44,7 @@ def save_state():
     except Exception as e:
         print("⚠️ Could not save state.json:", e)
 
+# --- TELEGRAM HELPERS ---
 def tg_send(text: str) -> Optional[int]:
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
@@ -49,7 +52,7 @@ def tg_send(text: str) -> Optional[int]:
         data = r.json()
         if not data.get("ok"):
             print("❌ Telegram sendMessage error:", data)
-        return data["result"]["message_id"] if data.get("ok") else None
+        return data.get("result", {}).get("message_id")
     except Exception as e:
         print("❌ Telegram sendMessage exception:", e)
         return None
@@ -70,6 +73,7 @@ def tg_pin(mid: Optional[int]):
     except:
         pass
 
+# --- HELPERS ---
 def safe_float(x, default=0.0):
     try:
         return float(str(x).replace(",", ""))
@@ -90,48 +94,62 @@ def extract_pair(attr):
     t1 = attr.get("token1", {}).get("symbol","?")
     return f"{t0}/{t1}"
 
+# --- DATA FETCH ---
 def fetch_trending(slug: str, size: int = 50):
     try:
         url = f"{GECKO_BASE}/networks/{slug}/pools?sort=-volume_usd.h24&page[size]={size}"
         r = requests.get(url, headers=GECKO_HEADERS, timeout=20)
+        r.raise_for_status()
         pools = r.json().get("data", [])
-        trend_list = []
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
-
-        for p in pools:
-            attrs = p.get("attributes", {})
-            h24_vol = safe_float((attrs.get("volume_usd") or {}).get("h24"))
-            pool_id = p.get("id")
-            trades_url = f"{GECKO_BASE}/networks/{slug}/pools/{pool_id}/trades"
-            t = requests.get(trades_url, headers=GECKO_HEADERS, timeout=20)
-            trades = t.json().get("data", [])
-            if not trades:
-                continue
-
-            recent_trades = [tr for tr in trades if datetime.fromisoformat(
-                tr["attributes"]["timestamp"].replace("Z", "+00:00")) >= cutoff]
-
-            if not recent_trades:
-                continue
-
-            short_vol = sum(float(tr["attributes"]["trade_amount_usd"]) for tr in recent_trades)
-            first_price = float(recent_trades[0]["attributes"]["price_usd"])
-            last_price = float(recent_trades[-1]["attributes"]["price_usd"])
-            price_change = ((last_price / first_price) - 1) * 100 if first_price > 0 else 0
-            trade_count = len(recent_trades)
-            spike_ratio = short_vol / h24_vol if h24_vol > 0 else 1.0
-
-            score = (short_vol * 0.5) + (abs(price_change) * 100) + (trade_count * 20) + (spike_ratio * 200)
-            trend_list.append((score, p, short_vol, price_change, trade_count, spike_ratio))
-
-        trend_list.sort(key=lambda x: x[0], reverse=True)
-        return trend_list
     except Exception as e:
-        print("⚠️ Error in custom trending logic:", e)
+        print(f"⚠️ Failed to fetch pools: {e}")
         return []
 
+    trend_list = []
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+
+    for p in pools:
+        attrs = p.get("attributes", {})
+        h24_vol = safe_float((attrs.get("volume_usd") or {}).get("h24"))
+        pool_id = p.get("id")
+
+        # Get trades for last 10 min
+        try:
+            trades_url = f"{GECKO_BASE}/networks/{slug}/pools/{pool_id}/trades"
+            t = requests.get(trades_url, headers=GECKO_HEADERS, timeout=15)
+            trades = t.json().get("data", [])
+        except:
+            trades = []
+
+        if not trades:
+            continue
+
+        recent_trades = [
+            tr for tr in trades
+            if datetime.fromisoformat(tr["attributes"]["timestamp"].replace("Z", "+00:00")) >= cutoff
+        ]
+        if not recent_trades:
+            continue
+
+        short_vol = sum(float(tr["attributes"]["trade_amount_usd"]) for tr in recent_trades)
+        first_price = float(recent_trades[0]["attributes"]["price_usd"])
+        last_price = float(recent_trades[-1]["attributes"]["price_usd"])
+        price_change = ((last_price / first_price) - 1) * 100 if first_price > 0 else 0
+        trade_count = len(recent_trades)
+        spike_ratio = short_vol / h24_vol if h24_vol > 0 else 1.0
+
+        score = (short_vol * 0.5) + (abs(price_change) * 100) + (trade_count * 20) + (spike_ratio * 200)
+        trend_list.append((score, p, short_vol, price_change, trade_count, spike_ratio))
+
+    trend_list.sort(key=lambda x: x[0], reverse=True)
+    return trend_list
+
+# --- FORMATTER ---
 def format_trending(slug, trend_list, top_n):
-    lines = ["🔥 <b>BESC Hyperchain — Live Trending</b>", "🕒 Last 10 min activity snapshot\n"]
+    lines = [
+        "🔥 <b>BESC Hyperchain — Live Trending</b>",
+        f"🕒 Last 10 min activity • {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
+    ]
     for i, (score, p, short_vol, price_change, trade_count, spike_ratio) in enumerate(trend_list[:top_n], 1):
         a = p.get("attributes", {})
         name = extract_pair(a)
@@ -139,11 +157,10 @@ def format_trending(slug, trend_list, top_n):
         pc_emoji = "📈" if price_change >= 0 else "📉"
         lines.append(
             f"{number_emoji(i)} <b>{name}</b>\n"
-            f"💵 Vol: {fmt_usd(short_vol)} | {pc_emoji} {price_change:+.2f}%\n"
-            f"🧮 Trades: {trade_count} | 🚀 Spike: {spike_ratio*100:.1f}%\n"
-            f"<a href='{link}'>View</a>\n"
+            f"{pc_emoji} {price_change:+.2f}% | 💵 {fmt_usd(short_vol)} | 🧮 {trade_count} trades\n"
+            f"🚀 Spike: {spike_ratio*100:.1f}% <a href='{link}'>View</a>\n"
         )
-    lines.append("<a href='https://www.geckoterminal.com/besc-hyperchain/pools'>View All Pools</a>")
+    lines.append("<a href='https://www.geckoterminal.com/besc-hyperchain/pools'>🔎 View All Pools</a>")
     return "\n".join(lines)
 
 def next_aligned(now):
@@ -153,28 +170,32 @@ def next_aligned(now):
     if add == 0: add = 5
     return (now + timedelta(minutes=add)).replace(second=0, microsecond=0)
 
+# --- MAIN LOOP ---
 def main():
     load_state()
     slug = FORCED_SLUG or "besc-hyperchain"
     print("Using slug:", slug)
 
-    now = datetime.now(timezone.utc)
-    next_trending = next_aligned(now)
+    next_trending = next_aligned(datetime.now(timezone.utc))
 
     while True:
         now = datetime.now(timezone.utc)
         if now >= next_trending:
             print(f"⏱ Checking trending at {now.isoformat()} UTC")
             trend_list = fetch_trending(slug)
+
+            tg_delete(state.get("last_trending_id"))
+
             if trend_list:
-                tg_delete(state.get("last_trending_id"))
                 mid = tg_send(format_trending(slug, trend_list, TRENDING_SIZE))
-                if mid:
-                    tg_pin(mid)
-                    state["last_trending_id"] = mid
-                    save_state()
             else:
-                print("⚠️ No active pools found in last 10 min.")
+                mid = tg_send("😴 <b>Nothing Trending detected yet — everyone’s asleep on-chain.</b>\n🕒 Check back in a few minutes!")
+
+            if mid:
+                tg_pin(mid)
+                state["last_trending_id"] = mid
+                save_state()
+
             next_trending = next_aligned(now)
         time.sleep(5)
 
