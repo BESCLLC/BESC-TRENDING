@@ -46,18 +46,19 @@ async function fetchTokenInfo(contract) {
       const { data } = await axios.get(`${HC_BASE}/token/info/${contract}`, { timeout: 15000 });
       const info = data?.success?.data || null;
       console.log(`[TrendingBot] Fetched info for contract ${contract}: ${info ? `Success, ${info.transactions?.length || 0} transactions` : 'No data'}`);
+      if (info && !info.transactions) console.log(`[TrendingBot] Raw response for ${contract}:`, JSON.stringify(data, null, 2));
       return info;
     } catch (e) {
       console.error(`[TrendingBot] Attempt ${i + 1} failed for ${contract}: ${e.message}`);
       if (i === 2) return null;
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(resolve => setTimeout(resolve, 2000)); // 2s delay between retries
     }
   }
 }
 
 async function computeTrending() {
   const pairs = await fetchPairs();
-  const cutoff = DateTime.utc().minus({ minutes: Number(POLL_INTERVAL_MINUTES) });
+  const cutoff = DateTime.utc().minus({ minutes: Number(POLL_INTERVAL_MINUTES) * 2 }); // Double window for testing
   console.log(`[TrendingBot] Cutoff time: ${cutoff.toISO()}`);
   const trending = [];
 
@@ -68,7 +69,7 @@ async function computeTrending() {
     const info0 = await fetchTokenInfo(p.token0.contract);
     const info1 = await fetchTokenInfo(p.token1.contract);
 
-    // Combine transactions from both tokens, no pair filter
+    // Combine transactions from both tokens
     const transactions = [
       ...(info0?.transactions || []),
       ...(info1?.transactions || [])
@@ -79,7 +80,10 @@ async function computeTrending() {
 
     console.log(`[TrendingBot] Found ${transactions.length} recent transactions for ${p.token0.symbol}/${p.token1.symbol}`);
 
-    if (!transactions.length) continue;
+    if (!transactions.length) {
+      console.log(`[TrendingBot] No recent transactions for ${p.token0.symbol}/${p.token1.symbol}, skipping`);
+      continue;
+    }
 
     const price = safeFloat(p.price || info0?.pair?.pairInfos?.value || info1?.pair?.pairInfos?.value || 0);
     if (price === 0) {
@@ -94,7 +98,6 @@ async function computeTrending() {
       const amountIn = safeFloat(tx.amountIn);
       const amountOut = safeFloat(tx.amountOut);
       const isMainTokenIn = tx.tokenIn === mainToken;
-      // Use amountIn if main token is input, otherwise use amountOut * price
       const vol = isMainTokenIn ? amountIn : amountOut * price;
       volUsd += vol;
       console.log(`[TrendingBot] Tx ${tx._id}: isMainTokenIn=${isMainTokenIn}, amountIn=${amountIn}, amountOut=${amountOut}, vol=${vol}, pair=${tx.pair}`);
