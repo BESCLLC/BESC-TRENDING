@@ -46,33 +46,29 @@ def save_state():
     except Exception as e:
         print("⚠️ Warning: Could not save state.json:", e)
 
-def tg_send(text: str) -> Optional[int]:
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+def tg_call(method, data):
     try:
-        r = requests.post(f"{TG_API}/sendMessage", data=payload, timeout=20)
-        data = r.json()
-        if not data.get("ok"):
-            print("❌ Telegram sendMessage error:", data)
-        return data["result"]["message_id"] if data.get("ok") else None
+        r = requests.post(f"{TG_API}/{method}", data=data, timeout=20)
+        resp = r.json()
+        if not resp.get("ok"):
+            print(f"⚠️ Telegram API error {method}:", resp)
+        return resp
     except Exception as e:
-        print("❌ Telegram sendMessage exception:", e)
-        return None
+        print(f"❌ Telegram API exception {method}:", e)
+        return {}
+
+def tg_send(text: str) -> Optional[int]:
+    data = tg_call("sendMessage", {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True})
+    return data.get("result", {}).get("message_id") if data.get("ok") else None
 
 def tg_delete(mid: Optional[int]):
     if mid:
-        try:
-            requests.post(f"{TG_API}/deleteMessage", data={"chat_id": CHAT_ID, "message_id": mid}, timeout=20)
-        except Exception as e:
-            print("⚠️ Warning: Failed to delete message:", e)
+        tg_call("deleteMessage", {"chat_id": CHAT_ID, "message_id": mid})
 
 def tg_pin(mid: Optional[int]):
-    if not mid:
-        return
-    try:
-        requests.post(f"{TG_API}/unpinAllChatMessages", data={"chat_id": CHAT_ID}, timeout=20)
-        requests.post(f"{TG_API}/pinChatMessage", data={"chat_id": CHAT_ID, "message_id": mid, "disable_notification": True}, timeout=20)
-    except Exception as e:
-        print("⚠️ Warning: Failed to pin message:", e)
+    if not mid: return
+    tg_call("unpinAllChatMessages", {"chat_id": CHAT_ID})
+    tg_call("pinChatMessage", {"chat_id": CHAT_ID, "message_id": mid, "disable_notification": True})
 
 def discover_slug() -> Optional[str]:
     try:
@@ -91,15 +87,13 @@ def fetch_trending(slug: str, size: int = 50, duration: str = "5m"):
         url = f"{GECKO_BASE}/networks/{slug}/trending_pools?duration={duration}&page[size]={size}"
         print(f"🌐 Fetching trending pools: {url}")
         r = requests.get(url, headers=GECKO_HEADERS, timeout=20)
+        r.raise_for_status()
         data = r.json()
         pools = data.get("data", [])
         print(f"📊 Gecko returned {len(pools)} pools for {duration}")
-        for p in pools[:3]:  # log first 3 pools
-            a = p.get("attributes", {})
-            print(f"   • {a.get('name','?')} — Vol: {(a.get('volume_usd') or {}).get('h24')}")
         return pools
     except Exception as e:
-        print("⚠️ Warning: Failed to fetch trending pools:", e)
+        print(f"⚠️ Warning: Failed to fetch trending pools ({duration}):", e)
         return []
 
 def safe_float(x, default=0.0):
@@ -109,10 +103,8 @@ def safe_float(x, default=0.0):
         return default
 
 def fmt_usd(n: float) -> str:
-    if n >= 1_000_000:
-        return f"${n/1_000_000:.2f}M"
-    if n >= 1_000:
-        return f"${n/1_000:.2f}K"
+    if n >= 1_000_000: return f"${n/1_000_000:.2f}M"
+    if n >= 1_000: return f"${n/1_000:.2f}K"
     return f"${n:.2f}"
 
 def number_emoji(n: int) -> str:
@@ -135,6 +127,8 @@ def extract_price_change(attr):
 
 # ---------- FORMATTERS ----------
 def format_trending(slug, pools, top_n):
+    if not pools:
+        return "😴 <b>No trending pools right now</b>\n🕒 Chain is quiet — check back soon!"
     title = "🦴 <b>Skeleton Top 5 — BESC Trending</b>\n"
     lines = [title]
     for i, p in enumerate(pools[:top_n], 1):
@@ -146,6 +140,8 @@ def format_trending(slug, pools, top_n):
     return "\n".join(lines)
 
 def format_gainers(slug, pools, top_n):
+    if not pools:
+        return "📭 <b>No gainers to show right now.</b>"
     sortable = []
     for p in pools:
         a = p.get("attributes", {})
@@ -189,26 +185,24 @@ def main():
             if now >= next_trending:
                 print(f"⏱ Checking trending at {now.isoformat()} UTC")
                 pools = fetch_trending(slug)
-                if pools:
-                    tg_delete(state.get("last_trending_id"))
-                    mid = tg_send(format_trending(slug, pools, TRENDING_SIZE))
-                    if mid:
-                        print(f"📤 Sent trending message ID: {mid}")
-                        tg_pin(mid)
-                        state["last_trending_id"] = mid
-                        save_state()
+                tg_delete(state.get("last_trending_id"))  # Always delete old
+                mid = tg_send(format_trending(slug, pools, TRENDING_SIZE))
+                if mid:
+                    print(f"📤 Sent trending message ID: {mid}")
+                    tg_pin(mid)
+                    state["last_trending_id"] = mid
+                    save_state()
                 next_trending = next_aligned(now, 0)
 
             if now >= next_gainers:
                 print(f"⏱ Checking gainers at {now.isoformat()} UTC")
                 pools = fetch_trending(slug)
-                if pools:
-                    tg_delete(state.get("last_gainers_id"))
-                    mid = tg_send(format_gainers(slug, pools, GAINERS_SIZE))
-                    if mid:
-                        print(f"📤 Sent gainers message ID: {mid}")
-                        state["last_gainers_id"] = mid
-                        save_state()
+                tg_delete(state.get("last_gainers_id"))
+                mid = tg_send(format_gainers(slug, pools, GAINERS_SIZE))
+                if mid:
+                    print(f"📤 Sent gainers message ID: {mid}")
+                    state["last_gainers_id"] = mid
+                    save_state()
                 next_gainers = next_aligned(now, OFFSET_MIN)
 
             time.sleep(5)
