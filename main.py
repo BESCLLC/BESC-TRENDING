@@ -17,6 +17,7 @@ logging.basicConfig(
         logging.StreamHandler()  # Output to console for Railway logs
     ]
 )
+logger = logging.getLogger(__name__)
 
 # Configuration
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -27,24 +28,37 @@ ALERT_THRESHOLD = os.environ.get("ALERT_THRESHOLD", "100").strip()
 CHECK_INTERVAL_MINUTES = 5  # Update every 5 minutes
 API_CALLS_PER_MINUTE = 10  # Rate limit for GeckoTerminal API
 
-# Validate environment variables
+# Validate environment variables and Telegram connectivity
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 try:
     if not BOT_TOKEN:
-        logging.error("TELEGRAM_BOT_TOKEN is missing")
+        logger.error("TELEGRAM_BOT_TOKEN is missing")
         raise SystemExit("❌ TELEGRAM_BOT_TOKEN is missing")
     if not CHAT_ID:
-        logging.error("TELEGRAM_CHAT_ID is missing")
+        logger.error("TELEGRAM_CHAT_ID is missing")
         raise SystemExit("❌ TELEGRAM_CHAT_ID is missing")
     ALERT_THRESHOLD = float(ALERT_THRESHOLD)
-    logging.info("Environment variables validated successfully")
-    logging.info(f"Networks: {', '.join(NETWORK_SLUGS)}")
-    logging.info(f"Alert threshold: {ALERT_THRESHOLD}%")
+    logger.info("Environment variables validated successfully")
+    logger.info(f"Networks: {', '.join(NETWORK_SLUGS)}")
+    logger.info(f"Alert threshold: {ALERT_THRESHOLD}%")
+
+    # Test Telegram API connectivity
+    test_response = requests.get(f"{TG_API}/getMe", timeout=10).json()
+    if not test_response.get("ok"):
+        logger.error(f"Invalid TELEGRAM_BOT_TOKEN: {test_response}")
+        raise SystemExit(f"❌ Invalid TELEGRAM_BOT_TOKEN: {test_response}")
+    logger.info("Telegram API connectivity verified")
 except ValueError as e:
-    logging.error(f"Invalid ALERT_THRESHOLD: {ALERT_THRESHOLD}")
+    logger.error(f"Invalid ALERT_THRESHOLD: {ALERT_THRESHOLD}")
     raise SystemExit(f"❌ Invalid ALERT_THRESHOLD: {ALERT_THRESHOLD}")
+except RequestException as e:
+    logger.error(f"Failed to connect to Telegram API: {e}")
+    raise SystemExit(f"❌ Failed to connect to Telegram API: {e}")
+except Exception as e:
+    logger.error(f"Unexpected error during startup: {e}")
+    raise SystemExit(f"❌ Unexpected error during startup: {e}")
 
 # API Endpoints
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 GECKO_BASE = "https://api.geckoterminal.com/api/v2"
 GECKO_HEADERS = {"accept": "application/json; version=20230302"}
 
@@ -57,18 +71,21 @@ def load_state():
     try:
         with open(STATE_FILE, "r") as f:
             state = json.load(f)
-        logging.info("Loaded state.json successfully")
+        logger.info("Loaded state.json successfully")
+    except FileNotFoundError:
+        logger.warning("state.json not found. Using default state")
+        state = {"last_trending_id": {}, "alerted_pools": {}}
     except Exception as e:
-        logging.warning(f"Could not load state.json: {e}. Using default state")
+        logger.warning(f"Could not load state.json: {e}. Using default state")
         state = {"last_trending_id": {}, "alerted_pools": {}}
 
 def save_state():
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
-        logging.info("Saved state.json successfully")
+        logger.info("Saved state.json successfully")
     except Exception as e:
-        logging.warning(f"Could not save state.json: {e}")
+        logger.warning(f"Could not save state.json: {e}")
 
 @sleep_and_retry
 @limits(calls=API_CALLS_PER_MINUTE, period=60)
@@ -80,11 +97,12 @@ def fetch_with_retry(url: str, headers: dict, method: str = "GET", data: dict = 
             else:
                 r = requests.get(url, headers=headers, timeout=20)
             r.raise_for_status()
+            logger.debug(f"Fetched {url} successfully (status: {r.status_code})")
             return r.json()
         except RequestException as e:
-            logging.warning(f"Request failed: {e}. Retrying {attempt+1}/{retries}")
+            logger.warning(f"Request failed for {url}: {e}. Retrying {attempt+1}/{retries}")
             time.sleep(backoff * (2 ** attempt))
-    logging.error(f"Failed to fetch {url} after {retries} retries")
+    logger.error(f"Failed to fetch {url} after {retries} retries")
     return {}
 
 def tg_send(text: str, parse_mode: str = "HTML") -> Optional[int]:
@@ -92,22 +110,22 @@ def tg_send(text: str, parse_mode: str = "HTML") -> Optional[int]:
     try:
         data = fetch_with_retry(f"{TG_API}/sendMessage", headers={}, method="POST", data=payload)
         if not data.get("ok"):
-            logging.error(f"Telegram sendMessage error: {data}")
+            logger.error(f"Telegram sendMessage error: {data}")
             return None
         message_id = data["result"]["message_id"]
-        logging.info(f"Sent Telegram message: {message_id}")
+        logger.info(f"Sent Telegram message: {message_id}")
         return message_id
     except Exception as e:
-        logging.error(f"Telegram sendMessage exception: {e}")
+        logger.error(f"Telegram sendMessage exception: {e}")
         return None
 
 def tg_delete(mid: Optional[int]):
     if mid:
         try:
             fetch_with_retry(f"{TG_API}/deleteMessage", headers={}, method="POST", data={"chat_id": CHAT_ID, "message_id": mid})
-            logging.info(f"Deleted Telegram message: {mid}")
+            logger.info(f"Deleted Telegram message: {mid}")
         except Exception as e:
-            logging.warning(f"Failed to delete Telegram message {mid}: {e}")
+            logger.warning(f"Failed to delete Telegram message {mid}: {e}")
 
 def tg_pin(mid: Optional[int]):
     if not mid:
@@ -115,9 +133,9 @@ def tg_pin(mid: Optional[int]):
     try:
         fetch_with_retry(f"{TG_API}/unpinAllChatMessages", headers={}, method="POST", data={"chat_id": CHAT_ID})
         fetch_with_retry(f"{TG_API}/pinChatMessage", headers={}, method="POST", data={"chat_id": CHAT_ID, "message_id": mid, "disable_notification": True})
-        logging.info(f"Pinned Telegram message: {mid}")
+        logger.info(f"Pinned Telegram message: {mid}")
     except Exception as e:
-        logging.warning(f"Failed to pin Telegram message {mid}: {e}")
+        logger.warning(f"Failed to pin Telegram message {mid}: {e}")
 
 def safe_float(x, default=0.0) -> float:
     try:
@@ -149,50 +167,57 @@ def number_emoji(n: int) -> str:
     return mapping.get(n, f"{n}.")
 
 def extract_pair(attr: dict) -> str:
-    t0 = attr.get("token0", {}).get("symbol", "?")
-    t1 = attr.get("token1", {}).get("symbol", "?")
-    return f"{t0}/{t1}"
+    # Fallback extraction since include=token0,token1 is removed; use embedded attributes
+    base_symbol = attr.get("base_token_symbol", "?")
+    quote_symbol = attr.get("quote_token_symbol", "?")
+    return f"{base_symbol}/{quote_symbol}"
 
 def fetch_trending(slug: str, size: int = 50) -> List[tuple]:
     try:
-        logging.info(f"Fetching trending pools for {slug}")
-        url = f"{GECKO_BASE}/networks/{slug}/pools?sort=-volume_usd.h24&page[size]={size}&include=token0%2Ctoken1"
+        logger.info(f"Fetching trending pools for {slug}")
+        # Fixed URL: Removed invalid &include=token0,token1
+        url = f"{GECKO_BASE}/networks/{slug}/pools?sort=-volume_usd.h24&page[size]={size}"
         data = fetch_with_retry(url, GECKO_HEADERS)
         pools = data.get("data", [])
+        logger.info(f"API response: {len(pools)} pools returned")
         trend_list = []
         cutoff_10m = datetime.now(timezone.utc) - timedelta(minutes=10)
 
         for p in pools:
             attrs = p.get("attributes", {})
-            h24_vol = safe_float((attrs.get("volume_usd") or {}).get("h24"))
-            liq = safe_float(attrs.get("reserve_in_usd"))
-            fdv = safe_float(attrs.get("fdv_usd"))
-            price_change_10m = safe_float((attrs.get("price_change_percentage") or {}).get("m5", 0))  # Using 5m as proxy for 10m
-            price_change_1h = safe_float((attrs.get("price_change_percentage") or {}).get("h1"))
-            price_change_24h = safe_float((attrs.get("price_change_percentage") or {}).get("h24"))
+            h24_vol = safe_float((attrs.get("volume_usd") or {}).get("h24", 0))
+            liq = safe_float(attrs.get("reserve_in_usd", 0))
+            fdv = safe_float(attrs.get("fdv_usd", 0))
+            price_change_10m = safe_float((attrs.get("price_change_percentage") or {}).get("m5", 0))
+            price_change_1h = safe_float((attrs.get("price_change_percentage") or {}).get("h1", 0))
+            price_change_24h = safe_float((attrs.get("price_change_percentage") or {}).get("h24", 0))
             pool_age = attrs.get("pool_created_at", "")
             pool_id = p.get("id")
 
-            # Fetch trades for net buys and recent volume
+            # Fetch trades only if needed; fallback to 24h metrics if no recent trades
             trades_url = f"{GECKO_BASE}/networks/{slug}/pools/{pool_id}/trades"
             trades = fetch_with_retry(trades_url, GECKO_HEADERS).get("data", [])
-            if not trades:
-                continue
+            recent_trades = []
+            if trades:
+                recent_trades = [
+                    tr for tr in trades
+                    if datetime.fromisoformat(tr["attributes"]["timestamp"].replace("Z", "+00:00")) >= cutoff_10m
+                ]
 
-            recent_trades = [
-                tr for tr in trades
-                if datetime.fromisoformat(tr["attributes"]["timestamp"].replace("Z", "+00:00")) >= cutoff_10m
-            ]
-            if not recent_trades:
-                continue
-
-            short_vol = sum(safe_float(tr["attributes"]["trade_amount_usd"]) for tr in recent_trades)
-            net_buys = sum(
-                safe_float(tr["attributes"]["trade_amount_usd"]) * (1 if tr["attributes"]["side"] == "buy" else -1)
-                for tr in recent_trades
-            )
-            trade_count = len(recent_trades)
-            spike_ratio = short_vol / h24_vol if h24_vol > 0 else 1.0
+            if recent_trades:
+                short_vol = sum(safe_float(tr["attributes"]["trade_amount_usd"]) for tr in recent_trades)
+                net_buys = sum(
+                    safe_float(tr["attributes"]["trade_amount_usd"]) * (1 if tr["attributes"]["side"] == "buy" else -1)
+                    for tr in recent_trades
+                )
+                trade_count = len(recent_trades)
+                spike_ratio = short_vol / h24_vol if h24_vol > 0 else 1.0
+            else:
+                # Fallback: Use 24h metrics if no recent trades
+                short_vol = h24_vol * 0.1  # Approximate 10m as 1/144 of 24h
+                net_buys = 0
+                trade_count = safe_float(attrs.get("txns_h24", 0))
+                spike_ratio = 1.0
 
             # Scoring: Balanced to favor high volume, price changes, liquidity, and net buys
             score = (
@@ -210,10 +235,10 @@ def fetch_trending(slug: str, size: int = 50) -> List[tuple]:
             ))
 
         trend_list.sort(key=lambda x: x[0], reverse=True)
-        logging.info(f"Fetched {len(trend_list)} trending pools for {slug}")
+        logger.info(f"Fetched {len(trend_list)} trending pools for {slug}")
         return trend_list[:TRENDING_SIZE]  # Limit to top 5
     except Exception as e:
-        logging.error(f"Error in fetch_trending for {slug}: {e}")
+        logger.error(f"Error in fetch_trending for {slug}: {e}")
         return []
 
 def send_alert(slug: str, pool: Dict, price_change_24h: float, h24_vol: float, link: str, pool_age: str):
@@ -223,6 +248,7 @@ def send_alert(slug: str, pool: Dict, price_change_24h: float, h24_vol: float, l
     if pool_id in alerted_pools:
         last_alerted = datetime.fromisoformat(alerted_pools[pool_id].replace("Z", "+00:00"))
         if (datetime.now(timezone.utc) - last_alerted).total_seconds() < 24 * 3600:
+            logger.debug(f"Skipping duplicate alert for pool {pool_id}")
             return
     name = extract_pair(pool.get("attributes", {}))
     text = (
@@ -236,7 +262,7 @@ def send_alert(slug: str, pool: Dict, price_change_24h: float, h24_vol: float, l
     if mid:
         state.setdefault("alerted_pools", {}).setdefault(slug, {})[pool_id] = datetime.now(timezone.utc).isoformat()
         save_state()
-        logging.info(f"Sent alert for {name} on {slug}: {price_change_24h:+.2f}%")
+        logger.info(f"Sent alert for {name} on {slug}: {price_change_24h:+.2f}%")
 
 def format_trending(slug: str, trend_list: List[tuple]) -> str:
     lines = [f"🔥 <b>{slug.upper()} — Top 5 Trending Tokens</b>", f"🕒 Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
@@ -265,19 +291,31 @@ def next_aligned(now: datetime) -> datetime:
     return (now + timedelta(minutes=add)).replace(second=0, microsecond=0)
 
 def main():
-    logging.info("✅ BESC Trending Bot starting up...")
+    logger.info("✅ BESC Trending Bot starting up...")
     try:
         load_state()
     except Exception as e:
-        logging.error(f"Failed to load state: {e}. Continuing with default state")
+        logger.error(f"Failed to load state: {e}. Continuing with default state")
+    
+    # Test GeckoTerminal API at startup
+    test_slug = NETWORK_SLUGS[0]
+    test_url = f"{GECKO_BASE}/networks/{test_slug}/pools?sort=-volume_usd.h24&page[size]=5"
+    test_data = fetch_with_retry(test_url, GECKO_HEADERS)
+    if not test_data.get("data"):
+        logger.warning(f"GeckoTerminal test fetch returned no data for {test_slug}. Check slug or API status.")
+    else:
+        logger.info(f"GeckoTerminal test fetch successful: {len(test_data['data'])} pools returned")
+    
     next_trending = next_aligned(datetime.now(timezone.utc))
+    logger.info(f"Next trending check at {next_trending.isoformat()} UTC")
 
     while True:
         try:
             now = datetime.now(timezone.utc)
             if now >= next_trending:
-                logging.info(f"⏱ Checking trending at {now.isoformat()} UTC")
+                logger.info(f"⏱ Checking trending at {now.isoformat()} UTC")
                 for slug in NETWORK_SLUGS:
+                    logger.info(f"Processing network: {slug}")
                     trend_list = fetch_trending(slug)
                     if trend_list:
                         # Send alerts for significant price changes
@@ -298,19 +336,22 @@ def main():
                             state.setdefault("last_trending_id", {})[slug] = mid
                             save_state()
                         else:
-                            logging.error(f"Failed to send trending message for {slug}")
+                            logger.error(f"Failed to send trending message for {slug}")
                     else:
-                        logging.warning(f"No active pools found for {slug} in last 10 min")
+                        logger.warning(f"No active pools found for {slug} in last 10 min")
                 next_trending = next_aligned(now)
+                logger.info(f"Next trending check at {next_trending.isoformat()} UTC")
             sleep_seconds = (next_trending - now).total_seconds()
+            logger.debug(f"Sleeping for {sleep_seconds:.2f} seconds")
             time.sleep(max(sleep_seconds, 1))
         except Exception as e:
-            logging.error(f"Main loop error: {e}. Retrying in 60 seconds")
+            logger.error(f"Main loop error: {e}. Retrying in 60 seconds")
             time.sleep(60)
 
 if __name__ == "__main__":
     try:
+        logger.info("Initializing bot...")
         main()
     except Exception as e:
-        logging.critical(f"Bot crashed: {e}")
+        logger.critical(f"Bot crashed: {e}")
         raise
