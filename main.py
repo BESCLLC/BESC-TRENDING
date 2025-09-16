@@ -3,15 +3,12 @@ import time
 import json
 import requests
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
-# ---------- CONFIG & DEBUG ----------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 FORCED_SLUG = os.environ.get("NETWORK_SLUG", "").strip()
 TRENDING_SIZE = int(os.environ.get("TRENDING_SIZE", "5"))
-GAINERS_SIZE = int(os.environ.get("GAINERS_SIZE", "5"))
-OFFSET_MIN = int(os.environ.get("OFFSET_MIN", "2"))  # minutes offset between trending & gainers
 
 print("🔎 Debug: Container launched.")
 print("BOT_TOKEN present:", bool(BOT_TOKEN))
@@ -20,7 +17,6 @@ print("FORCED_SLUG:", FORCED_SLUG)
 
 if not BOT_TOKEN or not CHAT_ID:
     print("❌ ERROR: Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
-    print("Sleeping 15 seconds so logs are visible before exit...")
     time.sleep(15)
     raise SystemExit("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
 
@@ -29,23 +25,22 @@ GECKO_BASE = "https://api.geckoterminal.com/api/v2"
 GECKO_HEADERS = {"accept": "application/json; version=20230302"}
 
 STATE_FILE = "state.json"
-state = {"last_trending_id": None, "last_gainers_id": None}
+state = {"last_trending_id": None}
 
-# ---------- UTIL ----------
 def load_state():
     global state
     try:
         with open(STATE_FILE, "r") as f:
             state = json.load(f)
     except Exception as e:
-        print("⚠️ Warning: Could not load state.json:", e)
+        print("⚠️ Could not load state.json:", e)
 
 def save_state():
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
     except Exception as e:
-        print("⚠️ Warning: Could not save state.json:", e)
+        print("⚠️ Could not save state.json:", e)
 
 def tg_send(text: str) -> Optional[int]:
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -63,43 +58,17 @@ def tg_delete(mid: Optional[int]):
     if mid:
         try:
             requests.post(f"{TG_API}/deleteMessage", data={"chat_id": CHAT_ID, "message_id": mid}, timeout=20)
-        except Exception as e:
-            print("⚠️ Warning: Failed to delete message:", e)
+        except:
+            pass
 
 def tg_pin(mid: Optional[int]):
-    """Pin the latest trending message (unpin others)."""
     if not mid:
         return
     try:
         requests.post(f"{TG_API}/unpinAllChatMessages", data={"chat_id": CHAT_ID}, timeout=20)
         requests.post(f"{TG_API}/pinChatMessage", data={"chat_id": CHAT_ID, "message_id": mid, "disable_notification": True}, timeout=20)
-    except Exception as e:
-        print("⚠️ Warning: Failed to pin message:", e)
-
-def discover_slug() -> Optional[str]:
-    try:
-        r = requests.get(f"{GECKO_BASE}/networks", headers=GECKO_HEADERS, timeout=20)
-        for item in r.json().get("data", []):
-            name = (item.get("attributes", {}).get("name") or "").lower()
-            nid = item.get("id")
-            if "besc" in name:
-                return nid
-    except Exception as e:
-        print("⚠️ Warning: Failed to fetch networks:", e)
-    return None
-
-def fetch_trending(slug: str, size: int = 50):
-    try:
-        url = f"{GECKO_BASE}/networks/{slug}/pools?sort=-5m_trend_score&page[size]={size}"
-        print(f"🌐 Fetching pools by trend score: {url}")
-        r = requests.get(url, headers=GECKO_HEADERS, timeout=20)
-        data = r.json()
-        pools = data.get("data", [])
-        print(f"📊 Gecko returned {len(pools)} pools sorted by trend score")
-        return pools
-    except Exception as e:
-        print("⚠️ Warning: Failed to fetch pools:", e)
-        return []
+    except:
+        pass
 
 def safe_float(x, default=0.0):
     try:
@@ -108,116 +77,106 @@ def safe_float(x, default=0.0):
         return default
 
 def fmt_usd(n: float) -> str:
-    if n >= 1_000_000:
-        return f"${n/1_000_000:.2f}M"
-    if n >= 1_000:
-        return f"${n/1_000:.2f}K"
+    if n >= 1_000_000: return f"${n/1_000_000:.2f}M"
+    if n >= 1_000: return f"${n/1_000:.2f}K"
     return f"${n:.2f}"
 
 def number_emoji(n: int) -> str:
-    mapping = {1:"1️⃣",2:"2️⃣",3:"3️⃣",4:"4️⃣",5:"5️⃣",6:"6️⃣",7:"7️⃣",8:"8️⃣",9:"9️⃣",10:"🔟"}
+    mapping = {1:"1️⃣",2:"2️⃣",3:"3️⃣",4:"4️⃣",5:"5️⃣"}
     return mapping.get(n, f"{n}.")
 
-def extract_pair(attr): 
+def extract_pair(attr):
     t0 = attr.get("token0", {}).get("symbol","?")
     t1 = attr.get("token1", {}).get("symbol","?")
     return f"{t0}/{t1}"
 
-def extract_price_change(attr):
-    pc = attr.get("price_change_percentage", {})
-    if isinstance(pc, dict) and "h24" in pc:
-        return safe_float(pc["h24"])
-    for k in ("price_change_percentage_h24", "price_change_24h", "price_change_h24"):
-        if k in attr:
-            return safe_float(attr[k])
-    return None
+def fetch_trending(slug: str, size: int = 50):
+    try:
+        url = f"{GECKO_BASE}/networks/{slug}/pools?sort=-volume_usd.h24&page[size]={size}"
+        r = requests.get(url, headers=GECKO_HEADERS, timeout=20)
+        pools = r.json().get("data", [])
+        trend_list = []
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
 
-# ---------- FORMATTERS ----------
-def format_trending(slug, pools, top_n):
-    title = "🦴 <b>Skeleton Top 5 — BESC Trending</b>\n"
-    lines = [title]
-    for i, p in enumerate(pools[:top_n], 1):
+        for p in pools:
+            attrs = p.get("attributes", {})
+            h24_vol = safe_float((attrs.get("volume_usd") or {}).get("h24"))
+            pool_id = p.get("id")
+            trades_url = f"{GECKO_BASE}/networks/{slug}/pools/{pool_id}/trades"
+            t = requests.get(trades_url, headers=GECKO_HEADERS, timeout=20)
+            trades = t.json().get("data", [])
+            if not trades:
+                continue
+
+            recent_trades = [tr for tr in trades if datetime.fromisoformat(
+                tr["attributes"]["timestamp"].replace("Z", "+00:00")) >= cutoff]
+
+            if not recent_trades:
+                continue
+
+            short_vol = sum(float(tr["attributes"]["trade_amount_usd"]) for tr in recent_trades)
+            first_price = float(recent_trades[0]["attributes"]["price_usd"])
+            last_price = float(recent_trades[-1]["attributes"]["price_usd"])
+            price_change = ((last_price / first_price) - 1) * 100 if first_price > 0 else 0
+            trade_count = len(recent_trades)
+            spike_ratio = short_vol / h24_vol if h24_vol > 0 else 1.0
+
+            score = (short_vol * 0.5) + (abs(price_change) * 100) + (trade_count * 20) + (spike_ratio * 200)
+            trend_list.append((score, p, short_vol, price_change, trade_count, spike_ratio))
+
+        trend_list.sort(key=lambda x: x[0], reverse=True)
+        return trend_list
+    except Exception as e:
+        print("⚠️ Error in custom trending logic:", e)
+        return []
+
+def format_trending(slug, trend_list, top_n):
+    lines = ["🔥 <b>BESC Hyperchain — Live Trending</b>", "🕒 Last 10 min activity snapshot\n"]
+    for i, (score, p, short_vol, price_change, trade_count, spike_ratio) in enumerate(trend_list[:top_n], 1):
         a = p.get("attributes", {})
         name = extract_pair(a)
-        vol = safe_float((a.get("volume_usd") or {}).get("h24"))
         link = a.get("url") or f"https://www.geckoterminal.com/{slug}/pools/{p.get('id')}"
-        lines.append(f"{number_emoji(i)} <b>{name}</b> 🧪📊\n💰 {fmt_usd(vol)} <a href='{link}'>DexS</a>\n")
+        pc_emoji = "📈" if price_change >= 0 else "📉"
+        lines.append(
+            f"{number_emoji(i)} <b>{name}</b>\n"
+            f"💵 Vol: {fmt_usd(short_vol)} | {pc_emoji} {price_change:+.2f}%\n"
+            f"🧮 Trades: {trade_count} | 🚀 Spike: {spike_ratio*100:.1f}%\n"
+            f"<a href='{link}'>View</a>\n"
+        )
+    lines.append("<a href='https://www.geckoterminal.com/besc-hyperchain/pools'>View All Pools</a>")
     return "\n".join(lines)
 
-def format_gainers(slug, pools, top_n):
-    sortable = []
-    for p in pools:
-        a = p.get("attributes", {})
-        pc = extract_price_change(a)
-        vol = safe_float((a.get("volume_usd") or {}).get("h24"))
-        sortable.append((pc if pc is not None else -9999.0, vol, p))
-    sortable.sort(key=lambda x:(x[0],x[1]), reverse=True)
-
-    title = "🚀 <b>Top 5 Gainers — BESC</b>\n"
-    lines = [title]
-    for i, (_,_,p) in enumerate(sortable[:top_n], 1):
-        a = p.get("attributes", {})
-        name = extract_pair(a)
-        pc = extract_price_change(a)
-        vol = safe_float((a.get("volume_usd") or {}).get("h24"))
-        pc_str = "n/a" if pc is None else f"{pc:+.2f}%"
-        link = a.get("url") or f"https://www.geckoterminal.com/{slug}/pools/{p.get('id')}"
-        lines.append(f"{number_emoji(i)} <b>{name}</b> 🚀📊\n📈 {pc_str} | 💰 {fmt_usd(vol)} <a href='{link}'>DexS</a>\n")
-    return "\n".join(lines)
-
-def next_aligned(now, offset):
+def next_aligned(now):
     total = int(now.timestamp() // 60)
-    remainder = (total - offset) % 5
+    remainder = total % 5
     add = (5 - remainder) % 5
     if add == 0: add = 5
     return (now + timedelta(minutes=add)).replace(second=0, microsecond=0)
 
-# ---------- MAIN LOOP ----------
 def main():
-    try:
-        load_state()
-        slug = FORCED_SLUG or discover_slug() or "besc-hyperchain"
-        print("Using slug:", slug)
+    load_state()
+    slug = FORCED_SLUG or "besc-hyperchain"
+    print("Using slug:", slug)
 
+    now = datetime.now(timezone.utc)
+    next_trending = next_aligned(now)
+
+    while True:
         now = datetime.now(timezone.utc)
-        next_trending = next_aligned(now, 0)
-        next_gainers = next_aligned(now, OFFSET_MIN)
-
-        while True:
-            now = datetime.now(timezone.utc)
-
-            if now >= next_trending:
-                print(f"⏱ Checking trending at {now.isoformat()} UTC")
-                pools = fetch_trending(slug)
-                if pools:
-                    tg_delete(state.get("last_trending_id"))
-                    mid = tg_send(format_trending(slug, pools, TRENDING_SIZE))
-                    if mid:
-                        tg_pin(mid)
-                        state["last_trending_id"] = mid
-                        save_state()
-                else:
-                    print("⚠️ No pools returned from Gecko for trending.")
-                next_trending = next_aligned(now, 0)
-
-            if now >= next_gainers:
-                print(f"⏱ Checking gainers at {now.isoformat()} UTC")
-                pools = fetch_trending(slug)
-                if pools:
-                    tg_delete(state.get("last_gainers_id"))
-                    mid = tg_send(format_gainers(slug, pools, GAINERS_SIZE))
-                    if mid:
-                        state["last_gainers_id"] = mid
-                        save_state()
-                else:
-                    print("⚠️ No pools returned from Gecko for gainers.")
-                next_gainers = next_aligned(now, OFFSET_MIN)
-
-            time.sleep(5)
-    except Exception as e:
-        print("❌ Fatal error in main loop:", e)
-        time.sleep(15)
-        raise
+        if now >= next_trending:
+            print(f"⏱ Checking trending at {now.isoformat()} UTC")
+            trend_list = fetch_trending(slug)
+            if trend_list:
+                tg_delete(state.get("last_trending_id"))
+                mid = tg_send(format_trending(slug, trend_list, TRENDING_SIZE))
+                if mid:
+                    tg_pin(mid)
+                    state["last_trending_id"] = mid
+                    save_state()
+            else:
+                print("⚠️ No active pools found in last 10 min.")
+            next_trending = next_aligned(now)
+        time.sleep(5)
 
 if __name__ == "__main__":
     print("✅ BESC Trending Bot starting up...")
