@@ -41,14 +41,17 @@ async function fetchPairs() {
 }
 
 async function fetchTokenInfo(contract) {
-  try {
-    const { data } = await axios.get(`${HC_BASE}/token/info/${contract}`, { timeout: 15000 });
-    const info = data?.success?.data || null;
-    console.log(`[TrendingBot] Fetched info for contract ${contract}: ${info ? `Success, ${info.transactions?.length || 0} transactions` : 'No data'}`);
-    return info;
-  } catch (e) {
-    console.error(`[TrendingBot] Failed to fetch info for ${contract}: ${e.message}`);
-    return null;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const { data } = await axios.get(`${HC_BASE}/token/info/${contract}`, { timeout: 15000 });
+      const info = data?.success?.data || null;
+      console.log(`[TrendingBot] Fetched info for contract ${contract}: ${info ? `Success, ${info.transactions?.length || 0} transactions` : 'No data'}`);
+      return info;
+    } catch (e) {
+      console.error(`[TrendingBot] Attempt ${i + 1} failed for ${contract}: ${e.message}`);
+      if (i === 2) return null;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
   }
 }
 
@@ -61,17 +64,17 @@ async function computeTrending() {
   for (const p of pairs) {
     console.log(`[TrendingBot] Processing pair ${p.token0.symbol}/${p.token1.symbol} (${p.pair})`);
 
-    // Try fetching transactions for both token0 and token1
+    // Fetch transactions for both tokens
     const info0 = await fetchTokenInfo(p.token0.contract);
     const info1 = await fetchTokenInfo(p.token1.contract);
 
-    // Combine transactions from both tokens
+    // Combine transactions from both tokens, no pair filter
     const transactions = [
       ...(info0?.transactions || []),
       ...(info1?.transactions || [])
     ].filter(tx => {
       const txTime = DateTime.fromSeconds(Math.floor(tx.time));
-      return txTime >= cutoff && tx.pair === p.pair; // Ensure transactions belong to this pair
+      return txTime >= cutoff;
     });
 
     console.log(`[TrendingBot] Found ${transactions.length} recent transactions for ${p.token0.symbol}/${p.token1.symbol}`);
@@ -86,15 +89,15 @@ async function computeTrending() {
     console.log(`[TrendingBot] Price for ${p.token0.symbol}/${p.token1.symbol}: ${price}`);
 
     let volUsd = 0;
-    const mainToken = info0?.pair?.pairInfos?.mainToken || p.token0.contract;
+    const mainToken = info0?.pair?.pairInfos?.mainToken || p.token1.contract; // Fallback to token1
     for (const tx of transactions) {
       const amountIn = safeFloat(tx.amountIn);
       const amountOut = safeFloat(tx.amountOut);
       const isMainTokenIn = tx.tokenIn === mainToken;
-      // If input is main token, use amountIn; if output is main token, use amountOut
+      // Use amountIn if main token is input, otherwise use amountOut * price
       const vol = isMainTokenIn ? amountIn : amountOut * price;
       volUsd += vol;
-      console.log(`[TrendingBot] Tx ${tx._id}: isMainTokenIn=${isMainTokenIn}, amountIn=${amountIn}, amountOut=${amountOut}, vol=${vol}`);
+      console.log(`[TrendingBot] Tx ${tx._id}: isMainTokenIn=${isMainTokenIn}, amountIn=${amountIn}, amountOut=${amountOut}, vol=${vol}, pair=${tx.pair}`);
     }
 
     console.log(`[TrendingBot] Total volume for ${p.token0.symbol}/${p.token1.symbol}: ${volUsd}`);
