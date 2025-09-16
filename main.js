@@ -47,15 +47,20 @@ async function computeTrending() {
   const pairs = await fetchPairs();
   const cutoff = DateTime.utc().minus({ minutes: Number(POLL_INTERVAL_MINUTES) });
 
+  // 🔥 Fetch all token infos in parallel
+  const tokenInfos = await Promise.all(
+    pairs.map(p => fetchTokenInfo(p.token0.contract))
+  );
+
   const scored = [];
-  for (const p of pairs) {
-    const tokenInfo = await fetchTokenInfo(p.token0.contract);
+  for (let i = 0; i < pairs.length; i++) {
+    const p = pairs[i];
+    const tokenInfo = tokenInfos[i];
     if (!tokenInfo?.transactions?.length) continue;
 
     const recentTx = tokenInfo.transactions.filter(tx =>
       DateTime.fromSeconds(Math.floor(tx.time)) >= cutoff
     );
-
     if (!recentTx.length) continue;
 
     const vol = recentTx.reduce((sum, tx) => sum + Number(tx.amountIn || 0), 0);
@@ -66,7 +71,6 @@ async function computeTrending() {
 
   scored.sort((a, b) => b.score - a.score);
 
-  // fallback: show top pairs by liquidity if no volume found
   if (!scored.length) {
     const fallback = pairs
       .sort((a, b) => (b.liquidityUsd ?? 0) - (a.liquidityUsd ?? 0))
