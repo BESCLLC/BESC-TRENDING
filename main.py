@@ -19,6 +19,7 @@ API_CALLS_PER_MINUTE = 10  # Rate limit for GeckoTerminal API
 
 # Validate environment variables
 if not BOT_TOKEN or not CHAT_ID:
+    logging.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
     raise SystemExit("❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
 
 # API Endpoints
@@ -56,7 +57,7 @@ def fetch_with_retry(url: str, headers: dict, method: str = "GET", data: dict = 
     for attempt in range(retries):
         try:
             if method == "POST":
-                r = requests.post(url, headers=headers, data=data, timeout=20)
+                r = requests.post(url, headers=headers, json=data, timeout=20)
             else:
                 r = requests.get(url, headers=headers, timeout=20)
             r.raise_for_status()
@@ -82,8 +83,8 @@ def tg_delete(mid: Optional[int]):
     if mid:
         try:
             fetch_with_retry(f"{TG_API}/deleteMessage", headers={}, method="POST", data={"chat_id": CHAT_ID, "message_id": mid})
-        except:
-            pass
+        except Exception as e:
+            logging.warning(f"Failed to delete Telegram message: {e}")
 
 def tg_pin(mid: Optional[int]):
     if not mid:
@@ -91,13 +92,13 @@ def tg_pin(mid: Optional[int]):
     try:
         fetch_with_retry(f"{TG_API}/unpinAllChatMessages", headers={}, method="POST", data={"chat_id": CHAT_ID})
         fetch_with_retry(f"{TG_API}/pinChatMessage", headers={}, method="POST", data={"chat_id": CHAT_ID, "message_id": mid, "disable_notification": True})
-    except:
-        pass
+    except Exception as e:
+        logging.warning(f"Failed to pin Telegram message: {e}")
 
 def safe_float(x, default=0.0) -> float:
     try:
         return float(str(x).replace(",", ""))
-    except:
+    except (ValueError, TypeError):
         return default
 
 def fmt_usd(n: float) -> str:
@@ -116,7 +117,7 @@ def fmt_age(created_at: str) -> str:
         if age.days > 0:
             return f"{age.days}d"
         return f"{int(age.total_seconds() // 3600)}h"
-    except:
+    except (ValueError, TypeError):
         return "N/A"
 
 def number_emoji(n: int) -> str:
@@ -184,15 +185,19 @@ def fetch_trending(slug: str, size: int = 50) -> List[tuple]:
             ))
 
         trend_list.sort(key=lambda x: x[0], reverse=True)
-        return trend_list
+        return trend_list[:TRENDING_SIZE]  # Limit to top 5
     except Exception as e:
         logging.error(f"Error in fetch_trending for {slug}: {e}")
         return []
 
 def send_alert(slug: str, pool: Dict, price_change_24h: float, h24_vol: float, link: str, pool_age: str):
     pool_id = pool.get("id")
-    if pool_id in state.get("alerted_pools", {}).get(slug, {}):
-        return  # Avoid duplicate alerts
+    # Avoid duplicate alerts within 24 hours
+    alerted_pools = state.get("alerted_pools", {}).get(slug, {})
+    if pool_id in alerted_pools:
+        last_alerted = datetime.fromisoformat(alerted_pools[pool_id].replace("Z", "+00:00"))
+        if (datetime.now(timezone.utc) - last_alerted).total_seconds() < 24 * 3600:
+            return
     name = extract_pair(pool.get("attributes", {}))
     text = (
         f"🚨 <b>ALERT: {name} on {slug.upper()}</b>\n"
@@ -208,7 +213,7 @@ def send_alert(slug: str, pool: Dict, price_change_24h: float, h24_vol: float, l
 
 def format_trending(slug: str, trend_list: List[tuple]) -> str:
     lines = [f"🔥 <b>{slug.upper()} — Top 5 Trending Tokens</b>", f"🕒 Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
-    for i, (score, p, short_vol, pc_10m, pc_1h, pc_24h, trade_count, spike_ratio, liq, fdv, net_buys, pool_age) in enumerate(trend_list[:TRENDING_SIZE], 1):
+    for i, (score, p, short_vol, pc_10m, pc_1h, pc_24h, trade_count, spike_ratio, liq, fdv, net_buys, pool_age) in enumerate(trend_list, 1):
         a = p.get("attributes", {})
         name = extract_pair(a)
         link = a.get("url") or f"https://www.geckoterminal.com/{slug}/pools/{p.get('id')}"
@@ -235,6 +240,7 @@ def next_aligned(now: datetime) -> datetime:
 def main():
     load_state()
     logging.info("✅ BESC Trending Bot starting up...")
+    logging.info(f"Networks: {', '.join(NETWORK_SLUGS)}")
     next_trending = next_aligned(datetime.now(timezone.utc))
 
     while True:
@@ -245,21 +251,24 @@ def main():
                 trend_list = fetch_trending(slug)
                 if trend_list:
                     # Send alerts for significant price changes
-                    for _, p, _, _, _, pc_24h, _, _, _, _, _, _ in trend_list:
+                    for _, p, _, _, _, pc_24h, _, _, _, _, _, pool_age in trend_list:
                         if abs(pc_24h) >= ALERT_THRESHOLD:
                             a = p.get("attributes", {})
                             h24_vol = safe_float((a.get("volume_usd") or {}).get("h24"))
                             link = a.get("url") or f"https://www.geckoterminal.com/{slug}/pools/{p.get('id')}"
-                            send_alert(slug, p, pc_24h, h24_vol, link, a.get("pool_created_at", ""))
+                            send_alert(slug, p, pc_24h, h24_vol, link, pool_age)
 
                     # Post top 5 trending pools
                     last_mid = state.get("last_trending_id", {}).get(slug)
                     tg_delete(last_mid)
-                    mid = tg_send(format_trending(slug, trend_list))
+                    text = format_trending(slug, trend_list)
+                    mid = tg_send(text)
                     if mid:
                         tg_pin(mid)
                         state.setdefault("last_trending_id", {})[slug] = mid
                         save_state()
+                    else:
+                        logging.error(f"Failed to send trending message for {slug}")
                 else:
                     logging.warning(f"No active pools found for {slug} in last 10 min")
             next_trending = next_aligned(now)
