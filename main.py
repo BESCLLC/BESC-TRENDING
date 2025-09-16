@@ -5,7 +5,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
-# ---------- CONFIG ----------
+# ---------- CONFIG & DEBUG ----------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 FORCED_SLUG = os.environ.get("NETWORK_SLUG", "").strip()
@@ -13,7 +13,15 @@ TRENDING_SIZE = int(os.environ.get("TRENDING_SIZE", "5"))
 GAINERS_SIZE = int(os.environ.get("GAINERS_SIZE", "5"))
 OFFSET_MIN = int(os.environ.get("OFFSET_MIN", "2"))  # minutes offset between trending & gainers
 
+print("🔎 Debug: Container launched.")
+print("BOT_TOKEN present:", bool(BOT_TOKEN))
+print("CHAT_ID value:", CHAT_ID)
+print("FORCED_SLUG:", FORCED_SLUG)
+
 if not BOT_TOKEN or not CHAT_ID:
+    print("❌ ERROR: Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+    print("Sleeping 15 seconds so logs are visible before exit...")
+    time.sleep(15)
     raise SystemExit("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -29,31 +37,34 @@ def load_state():
     try:
         with open(STATE_FILE, "r") as f:
             state = json.load(f)
-    except:
-        pass
+    except Exception as e:
+        print("⚠️ Warning: Could not load state.json:", e)
 
 def save_state():
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
-    except:
-        pass
+    except Exception as e:
+        print("⚠️ Warning: Could not save state.json:", e)
 
 def tg_send(text: str) -> Optional[int]:
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
         r = requests.post(f"{TG_API}/sendMessage", data=payload, timeout=20)
         data = r.json()
+        if not data.get("ok"):
+            print("❌ Telegram sendMessage error:", data)
         return data["result"]["message_id"] if data.get("ok") else None
-    except:
+    except Exception as e:
+        print("❌ Telegram sendMessage exception:", e)
         return None
 
 def tg_delete(mid: Optional[int]):
     if mid:
         try:
             requests.post(f"{TG_API}/deleteMessage", data={"chat_id": CHAT_ID, "message_id": mid}, timeout=20)
-        except:
-            pass
+        except Exception as e:
+            print("⚠️ Warning: Failed to delete message:", e)
 
 def tg_pin(mid: Optional[int]):
     """Pin the latest trending message (unpin others)."""
@@ -62,8 +73,8 @@ def tg_pin(mid: Optional[int]):
     try:
         requests.post(f"{TG_API}/unpinAllChatMessages", data={"chat_id": CHAT_ID}, timeout=20)
         requests.post(f"{TG_API}/pinChatMessage", data={"chat_id": CHAT_ID, "message_id": mid, "disable_notification": True}, timeout=20)
-    except:
-        pass
+    except Exception as e:
+        print("⚠️ Warning: Failed to pin message:", e)
 
 def discover_slug() -> Optional[str]:
     try:
@@ -73,14 +84,18 @@ def discover_slug() -> Optional[str]:
             nid = item.get("id")
             if "besc" in name:
                 return nid
-    except:
-        pass
+    except Exception as e:
+        print("⚠️ Warning: Failed to fetch networks:", e)
     return None
 
 def fetch_trending(slug: str, size: int = 50):
-    url = f"{GECKO_BASE}/networks/{slug}/trending_pools?page[size]={size}"
-    r = requests.get(url, headers=GECKO_HEADERS, timeout=20)
-    return r.json().get("data", [])
+    try:
+        url = f"{GECKO_BASE}/networks/{slug}/trending_pools?page[size]={size}"
+        r = requests.get(url, headers=GECKO_HEADERS, timeout=20)
+        return r.json().get("data", [])
+    except Exception as e:
+        print("⚠️ Warning: Failed to fetch trending pools:", e)
+        return []
 
 def safe_float(x, default=0.0):
     try:
@@ -155,39 +170,44 @@ def next_aligned(now, offset):
 
 # ---------- MAIN LOOP ----------
 def main():
-    load_state()
-    slug = FORCED_SLUG or discover_slug() or "besc-hyperchain"
-    print("Using slug:", slug)
+    try:
+        load_state()
+        slug = FORCED_SLUG or discover_slug() or "besc-hyperchain"
+        print("Using slug:", slug)
 
-    now = datetime.now(timezone.utc)
-    next_trending = next_aligned(now, 0)
-    next_gainers = next_aligned(now, OFFSET_MIN)
-
-    while True:
         now = datetime.now(timezone.utc)
+        next_trending = next_aligned(now, 0)
+        next_gainers = next_aligned(now, OFFSET_MIN)
 
-        if now >= next_trending:
-            pools = fetch_trending(slug)
-            if pools:
-                tg_delete(state.get("last_trending_id"))
-                mid = tg_send(format_trending(slug, pools, TRENDING_SIZE))
-                if mid:
-                    tg_pin(mid)  # auto-pin newest trending message
-                    state["last_trending_id"] = mid
-                    save_state()
-            next_trending = next_aligned(now, 0)
+        while True:
+            now = datetime.now(timezone.utc)
 
-        if now >= next_gainers:
-            pools = fetch_trending(slug)
-            if pools:
-                tg_delete(state.get("last_gainers_id"))
-                mid = tg_send(format_gainers(slug, pools, GAINERS_SIZE))
-                if mid:
-                    state["last_gainers_id"] = mid
-                    save_state()
-            next_gainers = next_aligned(now, OFFSET_MIN)
+            if now >= next_trending:
+                pools = fetch_trending(slug)
+                if pools:
+                    tg_delete(state.get("last_trending_id"))
+                    mid = tg_send(format_trending(slug, pools, TRENDING_SIZE))
+                    if mid:
+                        tg_pin(mid)
+                        state["last_trending_id"] = mid
+                        save_state()
+                next_trending = next_aligned(now, 0)
 
-        time.sleep(5)
+            if now >= next_gainers:
+                pools = fetch_trending(slug)
+                if pools:
+                    tg_delete(state.get("last_gainers_id"))
+                    mid = tg_send(format_gainers(slug, pools, GAINERS_SIZE))
+                    if mid:
+                        state["last_gainers_id"] = mid
+                        save_state()
+                next_gainers = next_aligned(now, OFFSET_MIN)
+
+            time.sleep(5)
+    except Exception as e:
+        print("❌ Fatal error in main loop:", e)
+        time.sleep(15)
+        raise
 
 if __name__ == "__main__":
     print("✅ BESC Trending Bot starting up...")
