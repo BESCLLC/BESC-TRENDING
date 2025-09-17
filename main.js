@@ -14,7 +14,7 @@ if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
 
 const bot = new TelegramBot(TELEGRAM_TOKEN);
 let lastPinnedId = null;
-let lastVolumes = {}; // memory for bursts
+let lastVolumes = {};
 
 function fmtUsd(n) {
   const num = Number(n);
@@ -33,7 +33,6 @@ function isGoodPool(p) {
   if (liq < 5000) return false;
   if (vol < 1000) return false;
   if (txs.buys < 3) return false;
-  if (txs.sells > txs.buys * 4) return false;
 
   const created = new Date(a.pool_created_at);
   if ((Date.now() - created.getTime()) / 60000 < 5) return false;
@@ -67,7 +66,7 @@ function formatTrending(pools) {
   pools.forEach((p, i) => {
     const a = p.attributes;
     const txs = a.transactions?.h24 || { buys: 0, sells: 0 };
-    const change = Number(a.price_change_percentage?.h24 || 0).toFixed(2);
+    const change = Number(a.price_change_percentage?.h24 || 0);
     const fdv = a.market_cap_usd || a.fdv_usd || 0;
     const fdvLabel = fdv ? `🏦 <b>FDV:</b> ${fmtUsd(fdv)} | ` : '';
 
@@ -76,21 +75,23 @@ function formatTrending(pools) {
     const burst = prevVol !== null ? currentVol - prevVol : 0;
     lastVolumes[a.address] = currentVol;
 
-    const burstLabel = prevVol !== null && burst > 0
-      ? `⚡ <b>Vol Burst:</b> +${fmtUsd(burst)}\n`
-      : '';
+    const burstPct = prevVol ? (burst / prevVol) * 100 : 0;
+    const burstLabel =
+      prevVol !== null && burst > 1000 && burstPct > 1
+        ? `⚡ <b>Vol Burst:</b> +${fmtUsd(burst)} (${burstPct.toFixed(1)}%)\n`
+        : '';
 
-    const warningLabel = txs.sells > txs.buys * 2
-      ? `⚠️ <b>High Sell Pressure</b>\n`
-      : '';
+    let sentiment = '';
+    if (txs.buys > txs.sells * 2) sentiment = '🟢 <b>Strong Buy Pressure</b>\n';
+    else if (txs.sells > txs.buys * 2) sentiment = '🔻 <b>Heavy Sell Pressure</b>\n';
 
     const link = `https://www.geckoterminal.com/besc-hyperchain/pools/${a.address}`;
 
     lines.push(
       `${i + 1}️⃣ <b>${a.name}</b>\n` +
-      `${burstLabel}${warningLabel}` +
+      `${burstLabel}${sentiment}` +
       `💵 <b>Vol:</b> ${fmtUsd(currentVol)} | 💧 <b>LQ:</b> ${fmtUsd(a.reserve_in_usd)}\n` +
-      `${fdvLabel}📈 <b>24h:</b> ${change}% | 🛒 <b>Buys:</b> ${txs.buys} | 🔻 <b>Sells:</b> ${txs.sells}\n` +
+      `${fdvLabel}📈 <b>24h:</b> ${change.toFixed(2)}% | 🛒 Buys: ${txs.buys} | 🔻 Sells: ${txs.sells}\n` +
       `<a href="${link}">📊 View on GeckoTerminal</a>\n`
     );
   });
@@ -102,7 +103,7 @@ async function postTrending() {
   try {
     let pools = await fetchPools();
 
-    // Weighted hotness: Volume + burst + price action
+    // Weighted hotness formula
     pools.sort((a, b) => {
       const volA = Number(a.attributes.volume_usd.h24);
       const volB = Number(b.attributes.volume_usd.h24);
@@ -115,8 +116,8 @@ async function postTrending() {
         ? volB - lastVolumes[b.attributes.address]
         : 0;
 
-      const hotnessA = volA * Math.log1p(changeA) + burstA * 1.5;
-      const hotnessB = volB * Math.log1p(changeB) + burstB * 1.5;
+      const hotnessA = volA + burstA * 2 + (volA * Math.log1p(changeA / 100));
+      const hotnessB = volB + burstB * 2 + (volB * Math.log1p(changeB / 100));
 
       return hotnessB - hotnessA;
     });
@@ -143,6 +144,6 @@ async function postTrending() {
   }
 }
 
-console.log('✅ BESC Trending Bot started.');
+console.log('✅ Precision Alpha Bot started.');
 setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
