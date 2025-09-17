@@ -6,7 +6,9 @@ const {
   TELEGRAM_TOKEN,
   TELEGRAM_CHAT_ID,
   POLL_INTERVAL_MINUTES = '5',
-  TRENDING_SIZE = '5'
+  TRENDING_SIZE = '5',
+  NEW_POOL_ALERT_LIQ = '5000',  // min liquidity to trigger alert
+  NEW_POOL_ALERT_VOL = '1000'   // min volume to trigger alert
 } = process.env;
 
 if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
@@ -29,14 +31,9 @@ function isGoodPool(p) {
   const liq = Number(a.reserve_in_usd || 0);
   const vol = Number(a.volume_usd.h24 || 0);
   const txs = a.transactions?.h24 || { buys: 0, sells: 0 };
-
-  if (liq < 5000) return false;
-  if (vol < 1000) return false;
-  if (txs.buys < 3) return false;
-
-  const created = new Date(a.pool_created_at);
-  if ((Date.now() - created.getTime()) / 60000 < 5) return false;
-
+  if (liq < 2000) return false;
+  if (vol < 500) return false;
+  if (txs.buys + txs.sells < 3) return false;
   return true;
 }
 
@@ -50,6 +47,32 @@ async function fetchPools() {
   } catch (e) {
     console.error('[TrendingBot] Failed to fetch pools:', e.message);
     return [];
+  }
+}
+
+async function sendNewPoolAlerts(pools) {
+  for (const p of pools) {
+    const a = p.attributes;
+    const created = new Date(a.pool_created_at);
+    const minutesOld = (Date.now() - created.getTime()) / 60000;
+
+    if (minutesOld < 15 &&
+        Number(a.reserve_in_usd) >= Number(NEW_POOL_ALERT_LIQ) &&
+        Number(a.volume_usd.h24) >= Number(NEW_POOL_ALERT_VOL)) {
+
+      const txs = a.transactions?.h24 || { buys: 0, sells: 0 };
+
+      await bot.sendMessage(
+        TELEGRAM_CHAT_ID,
+        `🚀 <b>NEW POOL DETECTED!</b>\n` +
+        `🎯 <b>${a.name}</b>\n` +
+        `⏱ Age: ${minutesOld.toFixed(1)} min | 🛒 Buyers: ${txs.buyers || txs.buys}\n` +
+        `💧 LQ: ${fmtUsd(a.reserve_in_usd)} | 💵 Vol: ${fmtUsd(a.volume_usd.h24)}\n` +
+        `📈 24h: ${Number(a.price_change_percentage?.h24 || 0).toFixed(2)}%\n` +
+        `<a href="https://www.geckoterminal.com/besc-hyperchain/pools/${a.address}">📊 View Pool</a>`,
+        { parse_mode: 'HTML', disable_web_page_preview: true }
+      );
+    }
   }
 }
 
@@ -103,24 +126,31 @@ async function postTrending() {
   try {
     let pools = await fetchPools();
 
-    // Weighted hotness formula
+    // Weighted hotness: favors volume burst, buyers, and recency
     pools.sort((a, b) => {
-      const volA = Number(a.attributes.volume_usd.h24);
-      const volB = Number(b.attributes.volume_usd.h24);
-      const changeA = Math.abs(Number(a.attributes.price_change_percentage?.h24 || 0));
-      const changeB = Math.abs(Number(b.attributes.price_change_percentage?.h24 || 0));
-      const burstA = lastVolumes[a.attributes.address]
-        ? volA - lastVolumes[a.attributes.address]
-        : 0;
-      const burstB = lastVolumes[b.attributes.address]
-        ? volB - lastVolumes[b.attributes.address]
-        : 0;
+      const va = Number(a.attributes.volume_usd.h24);
+      const vb = Number(b.attributes.volume_usd.h24);
+      const ca = Math.abs(Number(a.attributes.price_change_percentage?.h24 || 0));
+      const cb = Math.abs(Number(b.attributes.price_change_percentage?.h24 || 0));
 
-      const hotnessA = volA + burstA * 2 + (volA * Math.log1p(changeA / 100));
-      const hotnessB = volB + burstB * 2 + (volB * Math.log1p(changeB / 100));
+      const burstA = lastVolumes[a.attributes.address]
+        ? va - lastVolumes[a.attributes.address] : 0;
+      const burstB = lastVolumes[b.attributes.address]
+        ? vb - lastVolumes[b.attributes.address] : 0;
+
+      const buyersA = a.attributes.transactions?.h24?.buyers || 0;
+      const buyersB = b.attributes.transactions?.h24?.buyers || 0;
+
+      const ageA = (Date.now() - new Date(a.attributes.pool_created_at).getTime()) / 3600000;
+      const ageB = (Date.now() - new Date(b.attributes.pool_created_at).getTime()) / 3600000;
+
+      const hotnessA = va + burstA * 2 + buyersA * 50 + (va * Math.log1p(ca / 100)) + (ageA < 6 ? 500 : 0);
+      const hotnessB = vb + burstB * 2 + buyersB * 50 + (vb * Math.log1p(cb / 100)) + (ageB < 6 ? 500 : 0);
 
       return hotnessB - hotnessA;
     });
+
+    await sendNewPoolAlerts(pools); // fires launch alerts first
 
     const trending = pools.slice(0, Number(TRENDING_SIZE));
 
@@ -144,6 +174,6 @@ async function postTrending() {
   }
 }
 
-console.log('✅ Precision Alpha Bot started.');
+console.log('✅ Ultimate Alpha Bot started.');
 setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
