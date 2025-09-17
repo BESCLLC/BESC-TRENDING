@@ -6,7 +6,7 @@ const {
   TELEGRAM_TOKEN,
   TELEGRAM_CHAT_ID,
   POLL_INTERVAL_MINUTES = '5',
-  TRENDING_SIZE = '5',
+  TRENDING_SIZE = '15',
   NEW_POOL_ALERT_LIQ = '5000',  // min liquidity to trigger alert
   NEW_POOL_ALERT_VOL = '1000'   // min volume to trigger alert
 } = process.env;
