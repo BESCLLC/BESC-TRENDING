@@ -14,7 +14,7 @@ if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
 
 const bot = new TelegramBot(TELEGRAM_TOKEN);
 let lastPinnedId = null;
-let lastVolumes = {}; // memory of previous volumes for burst calc
+let lastVolumes = {}; // memory for bursts
 
 function fmtUsd(n) {
   const num = Number(n);
@@ -24,7 +24,6 @@ function fmtUsd(n) {
   return `$${num.toFixed(2)}`;
 }
 
-// Quality filter
 function isGoodPool(p) {
   const a = p.attributes;
   const liq = Number(a.reserve_in_usd || 0);
@@ -37,7 +36,7 @@ function isGoodPool(p) {
   if (txs.sells > txs.buys * 4) return false;
 
   const created = new Date(a.pool_created_at);
-  if ((Date.now() - created.getTime()) / 60000 < 5) return false; // <5 min old
+  if ((Date.now() - created.getTime()) / 60000 < 5) return false;
 
   return true;
 }
@@ -72,13 +71,12 @@ function formatTrending(pools) {
     const fdv = a.market_cap_usd || a.fdv_usd || 0;
     const fdvLabel = fdv ? `🏦 <b>FDV:</b> ${fmtUsd(fdv)} | ` : '';
 
-    // volume burst detection
-    const prevVol = lastVolumes[a.address] || 0;
+    const prevVol = lastVolumes[a.address] ?? null;
     const currentVol = Number(a.volume_usd.h24 || 0);
-    const burst = currentVol - prevVol;
+    const burst = prevVol !== null ? currentVol - prevVol : 0;
     lastVolumes[a.address] = currentVol;
 
-    const burstLabel = burst > 0
+    const burstLabel = prevVol !== null && burst > 0
       ? `⚡ <b>Vol Burst:</b> +${fmtUsd(burst)}\n`
       : '';
 
@@ -100,47 +98,30 @@ function formatTrending(pools) {
   return lines.join('\n');
 }
 
-// Separate new pool alerts
-async function sendNewPoolAlerts(pools) {
-  pools.forEach(async (p) => {
-    const a = p.attributes;
-    const created = new Date(a.pool_created_at);
-    const minutesOld = (Date.now() - created.getTime()) / 60000;
-
-    if (minutesOld < 60) {
-      const txs = a.transactions?.h24 || { buys: 0, sells: 0 };
-      if (Number(a.reserve_in_usd) >= 5000) {
-        await bot.sendMessage(
-          TELEGRAM_CHAT_ID,
-          `🚀 <b>New Pool Detected!</b>\n` +
-          `⏱ Age: ${minutesOld.toFixed(1)} min\n` +
-          `💧 <b>LQ:</b> ${fmtUsd(a.reserve_in_usd)} | 💵 <b>Vol(24h):</b> ${fmtUsd(a.volume_usd.h24)}\n` +
-          `📈 24h Change: ${Number(a.price_change_percentage?.h24 || 0).toFixed(2)}%\n` +
-          `🛒 Buys: ${txs.buys} | 🔻 Sells: ${txs.sells}\n` +
-          `<a href="https://www.geckoterminal.com/besc-hyperchain/pools/${a.address}">📊 View Pool</a>`,
-          { parse_mode: 'HTML', disable_web_page_preview: true }
-        );
-      }
-    }
-  });
-}
-
 async function postTrending() {
   try {
     let pools = await fetchPools();
 
-    // Sort by "hotness" = volume × log(1 + abs(price change))
+    // Weighted hotness: Volume + burst + price action
     pools.sort((a, b) => {
-      const va = Number(a.attributes.volume_usd.h24);
-      const vb = Number(b.attributes.volume_usd.h24);
-      const ca = Math.abs(Number(a.attributes.price_change_percentage?.h24 || 0));
-      const cb = Math.abs(Number(b.attributes.price_change_percentage?.h24 || 0));
-      return (vb * Math.log1p(cb)) - (va * Math.log1p(ca));
+      const volA = Number(a.attributes.volume_usd.h24);
+      const volB = Number(b.attributes.volume_usd.h24);
+      const changeA = Math.abs(Number(a.attributes.price_change_percentage?.h24 || 0));
+      const changeB = Math.abs(Number(b.attributes.price_change_percentage?.h24 || 0));
+      const burstA = lastVolumes[a.attributes.address]
+        ? volA - lastVolumes[a.attributes.address]
+        : 0;
+      const burstB = lastVolumes[b.attributes.address]
+        ? volB - lastVolumes[b.attributes.address]
+        : 0;
+
+      const hotnessA = volA * Math.log1p(changeA) + burstA * 1.5;
+      const hotnessB = volB * Math.log1p(changeB) + burstB * 1.5;
+
+      return hotnessB - hotnessA;
     });
 
     const trending = pools.slice(0, Number(TRENDING_SIZE));
-
-    await sendNewPoolAlerts(trending); // fire alerts first
 
     if (lastPinnedId) {
       await bot.unpinAllChatMessages(TELEGRAM_CHAT_ID).catch(() => {});
@@ -162,6 +143,6 @@ async function postTrending() {
   }
 }
 
-console.log('✅ Ultimate Trending Bot started.');
+console.log('✅ BESC Trending Bot started.');
 setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
