@@ -5,7 +5,7 @@ import axios from 'axios';
 const {
   TELEGRAM_TOKEN,
   TELEGRAM_CHAT_ID,
-  POLL_INTERVAL_MINUTES = '5',
+  POLL_INTERVAL_MINUTES = '5', // shorter interval = more real-time
   TRENDING_SIZE = '5'
 } = process.env;
 
@@ -23,29 +23,21 @@ function fmtUsd(n) {
   return `$${num.toFixed(2)}`;
 }
 
-// Quality filter: ensures we only show "good" pools
+// Quality filter to only show healthy pools
 function isGoodPool(p) {
   const a = p.attributes;
   const liq = Number(a.reserve_in_usd || 0);
   const vol = Number(a.volume_usd.h24 || 0);
   const txs = a.transactions?.h24 || { buys: 0, sells: 0 };
 
-  // 1. Liquidity ≥ $5k
   if (liq < 5000) return false;
-
-  // 2. Volume ≥ $1k
   if (vol < 1000) return false;
-
-  // 3. At least 3 buys in 24h
   if (txs.buys < 3) return false;
-
-  // 4. Avoid pools with 3x more sells than buys (likely dumping)
   if (txs.sells > txs.buys * 3) return false;
 
-  // 5. Avoid brand-new pools <15 minutes old (anti-honeypot)
   const created = new Date(a.pool_created_at);
   const minutesOld = (Date.now() - created.getTime()) / 60000;
-  if (minutesOld < 15) return false;
+  if (minutesOld < 10) return false;
 
   return true;
 }
@@ -68,7 +60,7 @@ async function fetchPools() {
 
 function formatTrending(pools) {
   if (!pools.length) {
-    return `😴 <b>No trending pairs right now</b>\n🕒 Chain is quiet — check back later!`;
+    return `😴 <b>No trending pools right now</b>\n🕒 Chain is quiet — check back soon!`;
   }
 
   const lines = [
@@ -80,12 +72,14 @@ function formatTrending(pools) {
     const a = p.attributes;
     const txs = a.transactions?.h24 || { buys: 0, sells: 0 };
     const change = Number(a.price_change_percentage?.h24 || 0).toFixed(2);
+    const fdv = a.market_cap_usd || a.fdv_usd || 0;
+    const fdvLabel = fdv ? `🏦 <b>FDV:</b> ${fmtUsd(fdv)} | ` : '';
     const link = `https://www.geckoterminal.com/besc-hyperchain/pools/${a.address}`;
 
     lines.push(
       `${i + 1}️⃣ <b>${a.name}</b>\n` +
       `💵 <b>Vol:</b> ${fmtUsd(a.volume_usd.h24)} | 💧 <b>LQ:</b> ${fmtUsd(a.reserve_in_usd)}\n` +
-      `📈 <b>24h:</b> ${change}% | 🛒 <b>Buys:</b> ${txs.buys} | 🔻 <b>Sells:</b> ${txs.sells}\n` +
+      `${fdvLabel}📈 <b>24h:</b> ${change}% | 🛒 <b>Buys:</b> ${txs.buys} | 🔻 <b>Sells:</b> ${txs.sells}\n` +
       `<a href="${link}">📊 View on GeckoTerminal</a>\n`
     );
   });
@@ -95,10 +89,18 @@ function formatTrending(pools) {
 
 async function postTrending() {
   try {
-    const pools = await fetchPools();
-    const trending = pools
-      .sort((a, b) => Number(b.attributes.volume_usd.h24) - Number(a.attributes.volume_usd.h24))
-      .slice(0, Number(TRENDING_SIZE));
+    let pools = await fetchPools();
+
+    // Sort "hotness" = volume * log(1+priceChangeAbs)
+    pools.sort((a, b) => {
+      const va = Number(a.attributes.volume_usd.h24);
+      const vb = Number(b.attributes.volume_usd.h24);
+      const ca = Math.abs(Number(a.attributes.price_change_percentage?.h24 || 0));
+      const cb = Math.abs(Number(b.attributes.price_change_percentage?.h24 || 0));
+      return (vb * Math.log1p(cb)) - (va * Math.log1p(ca));
+    });
+
+    const trending = pools.slice(0, Number(TRENDING_SIZE));
 
     if (lastPinnedId) {
       await bot.unpinAllChatMessages(TELEGRAM_CHAT_ID).catch(() => {});
