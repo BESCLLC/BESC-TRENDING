@@ -8,7 +8,13 @@ const {
   POLL_INTERVAL_MINUTES = '5',
   TRENDING_SIZE = '8',
   MIN_LIQ = '200',
+  BLOCKED_TOKENS = 'WAGMI',  // comma-separated base token names to always hide
 } = process.env;
+
+// Build a Set from the env var so adding new blocked tokens needs no redeploy
+const BLOCKED_SET = new Set(
+  BLOCKED_TOKENS.split(',').map(t => t.trim().toUpperCase()).filter(Boolean)
+);
 
 if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
   throw new Error('Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID');
@@ -19,8 +25,15 @@ let prevRankMap = {};
 let prevH24Vol = {};
 let alertedPools = new Map(); // address -> timestamp
 
-// Never surface stablecoin base tokens in trending
-const STABLE_RE = /^(USDC|USDT|BUSD|BUSDC|DAI|FRAX|TUSD|USDD|LUSD|GUSD|USDP|MIM|CUSD|SUSD|HUSD|FDUSD|PYUSD|CRVUSD|USDB|DOLA|EURC|EURT|EURS|WUSDC|WUSDT)/i;
+// The chain's native wrapped token — always the "quote" in a proper pair
+const CHAIN_NATIVE = 'WBESC';
+
+// When GeckoTerminal indexes a pool backwards (bridged major as base, WBESC as quote),
+// we flip it so WBESC is the base and the price/changes make sense for this chain.
+const FLIP_IF_BASE = /^(WBNB|WETH|WBTC|WMATIC|WAVAX|WSOL|WFTM|WONE|WCRO|WKCS|BNB|ETH|BTC)/i;
+
+// Stablecoin base tokens — never useful in a trending list
+const STABLE_RE = /^(USDC|USDT|BUSD|BUSDC|FUSD|WUSD|DAI|FRAX|TUSD|USDD|LUSD|GUSD|USDP|MIM|CUSD|SUSD|HUSD|FDUSD|PYUSD|CRVUSD|USDB|DOLA|EURC|EURT|EURS|WUSDC|WUSDT)/i;
 
 // ─── Formatters ───────────────────────────────────────────────────────────────
 
@@ -47,12 +60,12 @@ function fmtPct(n) {
   return `${num >= 0 ? '+' : ''}${num.toFixed(1)}%`;
 }
 
-// Fall back to h1 when m5 is flat — avoids misleading green on idle pools
+// Fall back to h1 when m5 is flat so idle pools don't get a misleading 🟢
 function moodEmoji(chgM5, chgH1) {
   const n = Math.abs(Number(chgM5)) < 0.1 ? Number(chgH1) : Number(chgM5);
   if (n >= 15) return '🚀';
-  if (n >= 5) return '📈';
-  if (n >= 0) return '🟢';
+  if (n >= 5)  return '📈';
+  if (n >= 0)  return '🟢';
   if (n >= -5) return '🟡';
   return '🔴';
 }
@@ -70,21 +83,68 @@ function rankBadge(i) {
   return ['🥇', '🥈', '🥉'][i] ?? `${i + 1}.`;
 }
 
+// ─── Pair orientation ──────────────────────────────────────────────────────────
+// GeckoTerminal sometimes indexes pools with a bridged major (WBNB, WETH) as
+// the base and WBESC as the quote. On BESC HyperChain, WBESC is the native so
+// we flip those pairs so the display, price, and changes are all WBESC-centric.
+
+function getPairView(p) {
+  const a = p.attributes;
+  const parts = (a.name || '').split('/').map(s => s.trim());
+  const baseName  = parts[0] || '';
+  const quoteName = parts[1] || '';
+
+  const flipped = FLIP_IF_BASE.test(baseName) && quoteName === CHAIN_NATIVE;
+
+  if (flipped) {
+    // Price changes: if WBNB rose +5% vs WBESC, then WBESC fell ~-5% vs WBNB
+    const inv = (x) => -(Number(x) || 0);
+    return {
+      name:    `${CHAIN_NATIVE} / ${baseName}`,
+      price:   a.quote_token_price_usd,   // USD price of WBESC
+      mc:      null,                        // can't derive WBESC MC from this pool alone
+      chgM5:   inv(a.price_change_percentage?.m5),
+      chgH1:   inv(a.price_change_percentage?.h1),
+      chgH6:   inv(a.price_change_percentage?.h6),
+      chgH24:  inv(a.price_change_percentage?.h24),
+      // From WBESC perspective, a "buy of WBNB" = "sell of WBESC" and vice versa
+      buysH1:  a.transactions?.h1?.sells || 0,
+      sellsH1: a.transactions?.h1?.buys  || 0,
+      volM5:   Number(a.volume_usd?.m5  || 0),
+      volH1:   Number(a.volume_usd?.h1  || 0),
+      volH24:  Number(a.volume_usd?.h24 || 0),
+    };
+  }
+
+  return {
+    name:    a.name,
+    price:   a.base_token_price_usd,
+    mc:      a.market_cap_usd || a.fdv_usd,
+    chgM5:   Number(a.price_change_percentage?.m5  || 0),
+    chgH1:   Number(a.price_change_percentage?.h1  || 0),
+    chgH6:   Number(a.price_change_percentage?.h6  || 0),
+    chgH24:  Number(a.price_change_percentage?.h24 || 0),
+    buysH1:  a.transactions?.h1?.buys  || 0,
+    sellsH1: a.transactions?.h1?.sells || 0,
+    volM5:   Number(a.volume_usd?.m5  || 0),
+    volH1:   Number(a.volume_usd?.h1  || 0),
+    volH24:  Number(a.volume_usd?.h24 || 0),
+  };
+}
+
 // ─── Pool quality filter ───────────────────────────────────────────────────────
 
 function isGoodPool(p) {
-  const baseName = (p.attributes.name || '').split('/')[0].trim();
+  const baseName = (p.attributes.name || '').split('/')[0].trim().toUpperCase();
   if (STABLE_RE.test(baseName)) return false;
+  if (BLOCKED_SET.has(baseName)) return false;
 
-  const a = p.attributes;
+  const a   = p.attributes;
   const liq = Number(a.reserve_in_usd || 0);
-  const volH24 = Number(a.volume_usd?.h24 || 0);
-  const volH1 = Number(a.volume_usd?.h1 || 0);
   const txH24 = a.transactions?.h24 || {};
-  const txH1 = a.transactions?.h1 || {};
-  const txM5 = a.transactions?.m5 || {};
+  const txH1  = a.transactions?.h1  || {};
+  const txM5  = a.transactions?.m5  || {};
 
-  // On a new/low-activity chain just block pools with no liquidity at all
   if (liq < Number(MIN_LIQ)) return false;
   if ((txH24.buys || 0) + (txH24.sells || 0) + (txH1.buys || 0) + (txM5.buys || 0) < 1) return false;
 
@@ -94,37 +154,35 @@ function isGoodPool(p) {
 // ─── Hotness score ─────────────────────────────────────────────────────────────
 
 function hotness(p) {
-  const a = p.attributes;
-  const volM5 = Number(a.volume_usd?.m5 || 0);
-  const volH1 = Number(a.volume_usd?.h1 || 0);
+  const a      = p.attributes;
+  const volM5  = Number(a.volume_usd?.m5  || 0);
+  const volH1  = Number(a.volume_usd?.h1  || 0);
   const volH24 = Number(a.volume_usd?.h24 || 0);
-  const chgM5 = Math.abs(Number(a.price_change_percentage?.m5 || 0));
-  const chgH1 = Math.abs(Number(a.price_change_percentage?.h1 || 0));
-  const txH1 = a.transactions?.h1 || {};
-  const buysH1 = txH1.buys || 0;
+  const chgM5  = Math.abs(Number(a.price_change_percentage?.m5 || 0));
+  const chgH1  = Math.abs(Number(a.price_change_percentage?.h1 || 0));
+  const txH1   = a.transactions?.h1 || {};
+  const buysH1  = txH1.buys  || 0;
   const sellsH1 = txH1.sells || 0;
   const totalH1 = buysH1 + sellsH1;
 
-  // h1 acceleration vs h24 rolling average
-  const h24avg = volH24 / 24;
-  const accel = h24avg > 50 ? volH1 / h24avg : 1;
-
+  const h24avg      = volH24 / 24;
+  const accel       = h24avg > 50 ? volH1 / h24avg : 1;
   const buyPressure = totalH1 > 0 ? buysH1 / totalH1 : 0.5;
 
   const prevVol = prevH24Vol[a.address] ?? volH24;
-  const burst = Math.max(0, volH24 - prevVol);
+  const burst   = Math.max(0, volH24 - prevVol);
 
-  const ageH = (Date.now() - new Date(a.pool_created_at).getTime()) / 3_600_000;
+  const ageH    = (Date.now() - new Date(a.pool_created_at).getTime()) / 3_600_000;
   const newBonus = ageH < 1 ? 3000 : ageH < 6 ? 800 : ageH < 12 ? 150 : 0;
 
   return (
-    volM5 * 300 +
-    volH1 * 20 +
+    volM5  * 300 +
+    volH1  * 20  +
     volH24 * 0.4 +
-    burst * 10 +
+    burst  * 10  +
     buysH1 * 100 +
-    chgM5 * volM5 * 0.2 +
-    chgH1 * volH1 * 0.1 +
+    chgM5  * volM5 * 0.2 +
+    chgH1  * volH1 * 0.1 +
     (accel > 2 ? volH1 * 8 * Math.min(accel, 8) : 0) +
     (buyPressure > 0.65 ? volH1 * 5 : 0) +
     newBonus
@@ -141,7 +199,7 @@ async function fetchPools() {
 
   const [byH24, byH1] = await Promise.all([
     get({ sort: 'h24_volume_usd_desc', page: 1 }),
-    get({ sort: 'h1_volume_usd_desc', page: 1 }),
+    get({ sort: 'h1_volume_usd_desc',  page: 1 }),
   ]);
 
   const seen = new Set();
@@ -168,29 +226,23 @@ async function sendNewPoolAlerts(pools) {
     if (ageMins > 30) continue;
 
     const liq = Number(a.reserve_in_usd || 0);
-    const volH1 = Number(a.volume_usd?.h1 || 0);
-    const volM5 = Number(a.volume_usd?.m5 || 0);
     if (liq < 200) continue;
 
     alertedPools.set(a.address, Date.now());
 
-    const txH1 = a.transactions?.h1 || {};
-    const buys = txH1.buys || 0;
-    const sells = txH1.sells || 0;
-    const buyPct = buys + sells > 0 ? Math.round(buys / (buys + sells) * 100) : 50;
-    const mc = a.market_cap_usd || a.fdv_usd;
-    const price = fmtPrice(a.base_token_price_usd);
-    const chgM5 = Number(a.price_change_percentage?.m5 || 0);
-    const chgH1 = Number(a.price_change_percentage?.h1 || 0);
+    const pv     = getPairView(p);
+    const price  = fmtPrice(pv.price);
+    const buyPct = pv.buysH1 + pv.sellsH1 > 0
+      ? Math.round(pv.buysH1 / (pv.buysH1 + pv.sellsH1) * 100) : 50;
 
     await bot.sendMessage(TELEGRAM_CHAT_ID,
       `🆕 <b>NEW LAUNCH DETECTED</b>\n` +
       `━━━━━━━━━━━━━━━━━━━\n` +
-      `<b>${a.name}</b>  ·  ${ageStr(a.pool_created_at)} old\n` +
-      (price ? `💰 <b>${price}</b>${mc ? `  MC: ${fmtUsd(mc)}` : ''}\n` : '') +
-      `📊 5m: <b>${fmtPct(chgM5)}</b>  ·  1h: <b>${fmtPct(chgH1)}</b>\n` +
-      `💵 Vol → 5m: ${fmtUsd(volM5)}  ·  1h: ${fmtUsd(volH1)}\n` +
-      `💧 Liq: ${fmtUsd(liq)}  ·  ${buys}B / ${sells}S (${buyPct}% buys)\n` +
+      `<b>${pv.name}</b>  ·  ${ageStr(a.pool_created_at)} old\n` +
+      (price ? `💰 <b>${price}</b>${pv.mc ? `  MC: ${fmtUsd(pv.mc)}` : ''}\n` : '') +
+      `📊 5m: <b>${fmtPct(pv.chgM5)}</b>  ·  1h: <b>${fmtPct(pv.chgH1)}</b>\n` +
+      `💵 Vol → 5m: ${fmtUsd(pv.volM5)}  ·  1h: ${fmtUsd(pv.volH1)}\n` +
+      `💧 Liq: ${fmtUsd(liq)}  ·  ${pv.buysH1}B / ${pv.sellsH1}S (${buyPct}% buys)\n` +
       `<a href="https://www.geckoterminal.com/besc-hyperchain/pools/${a.address}">📊 Open Chart</a>`,
       { parse_mode: 'HTML', disable_web_page_preview: true }
     ).catch(e => console.error('[TrendingBot] Alert failed:', e.message));
@@ -198,8 +250,6 @@ async function sendNewPoolAlerts(pools) {
 }
 
 // ─── Trending message ──────────────────────────────────────────────────────────
-// Lines are kept short (no indents, no 4-timeframe rows) so they don't wrap
-// awkwardly on mobile Telegram.
 
 function formatTrending(pools, movers) {
   const time = new Date().toLocaleTimeString('en-US', {
@@ -222,30 +272,20 @@ function formatTrending(pools, movers) {
   }
 
   for (let i = 0; i < pools.length; i++) {
-    const p = pools[i];
-    const a = p.attributes;
+    const p  = pools[i];
+    const a  = p.attributes;
+    const pv = getPairView(p);
 
-    const volM5 = Number(a.volume_usd?.m5 || 0);
-    const volH1 = Number(a.volume_usd?.h1 || 0);
-    const volH24 = Number(a.volume_usd?.h24 || 0);
-    const chgM5 = Number(a.price_change_percentage?.m5 || 0);
-    const chgH1 = Number(a.price_change_percentage?.h1 || 0);
-    const chgH6 = Number(a.price_change_percentage?.h6 || 0);
-    const chgH24 = Number(a.price_change_percentage?.h24 || 0);
-    const txH1 = a.transactions?.h1 || {};
-    const buysH1 = txH1.buys || 0;
-    const sellsH1 = txH1.sells || 0;
-    const totalH1 = buysH1 + sellsH1;
-    const buyPct = totalH1 > 0 ? Math.round(buysH1 / totalH1 * 100) : 50;
-    const mc = a.market_cap_usd || a.fdv_usd;
-    const price = fmtPrice(a.base_token_price_usd);
+    const price    = fmtPrice(pv.price);
+    const totalH1  = pv.buysH1 + pv.sellsH1;
+    const buyPct   = totalH1 > 0 ? Math.round(pv.buysH1 / totalH1 * 100) : 50;
 
-    // Volume acceleration: how fast is h1 vs the h24 hourly average
-    const h24avg = volH24 / 24;
-    const accel = h24avg > 50 ? volH1 / h24avg : null;
+    // Volume acceleration vs h24 rolling average
+    const h24avg   = pv.volH24 / 24;
+    const accel    = h24avg > 50 ? pv.volH1 / h24avg : null;
     const accelTag = accel && accel > 1.5 ? ` ⚡${accel.toFixed(1)}x` : '';
 
-    // Rank change since last run
+    // Rank movement
     const prevRank = prevRankMap[a.address];
     let rankTag = '';
     if (prevRank !== undefined && prevRank !== i) {
@@ -253,22 +293,21 @@ function formatTrending(pools, movers) {
       rankTag = delta > 0 ? ` 🔺+${delta}` : ` 🔻${Math.abs(delta)}`;
     }
 
-    // Age tag for pools under 12h
-    const ageH = (Date.now() - new Date(a.pool_created_at).getTime()) / 3_600_000;
+    // Age tag for pools under 12h old
+    const ageH   = (Date.now() - new Date(a.pool_created_at).getTime()) / 3_600_000;
     const ageTag = ageH < 12 ? ` 🆕${ageStr(a.pool_created_at)}` : '';
 
     const bpTag = buyPct >= 70 ? ' 🟢' : buyPct >= 55 ? ' 📈' : buyPct <= 30 ? ' 🔴' : '';
 
     const link = `https://www.geckoterminal.com/besc-hyperchain/pools/${a.address}`;
 
-    // Two separate price-change lines (5m+1h / 6h+24h) prevent mid-line wrap on mobile
     lines.push(
-      `\n${rankBadge(i)} <b>${a.name}</b>${rankTag}${accelTag}${ageTag}\n` +
-      (price ? `💰 <b>${price}</b>${mc ? `  MC: ${fmtUsd(mc)}` : ''}\n` : '') +
-      `${moodEmoji(chgM5, chgH1)} 5m: <b>${fmtPct(chgM5)}</b>  ·  1h: <b>${fmtPct(chgH1)}</b>\n` +
-      `📅 6h: <b>${fmtPct(chgH6)}</b>  ·  24h: <b>${fmtPct(chgH24)}</b>\n` +
-      `📊 Vol 1h: ${fmtUsd(volH1)}  💧 Liq: ${fmtUsd(a.reserve_in_usd)}\n` +
-      `🔄 ${buyPct}% Buys (${buysH1}B / ${sellsH1}S)${bpTag}  <a href="${link}">Chart ↗</a>`
+      `\n${rankBadge(i)} <b>${pv.name}</b>${rankTag}${accelTag}${ageTag}\n` +
+      (price ? `💰 <b>${price}</b>${pv.mc ? `  MC: ${fmtUsd(pv.mc)}` : ''}\n` : '') +
+      `${moodEmoji(pv.chgM5, pv.chgH1)} 5m: <b>${fmtPct(pv.chgM5)}</b>  ·  1h: <b>${fmtPct(pv.chgH1)}</b>\n` +
+      `📅 6h: <b>${fmtPct(pv.chgH6)}</b>  ·  24h: <b>${fmtPct(pv.chgH24)}</b>\n` +
+      `📊 Vol 1h: ${fmtUsd(pv.volH1)}  💧 Liq: ${fmtUsd(a.reserve_in_usd)}\n` +
+      `🔄 ${buyPct}% Buys (${pv.buysH1}B / ${pv.sellsH1}S)${bpTag}  <a href="${link}">Chart ↗</a>`
     );
   }
 
@@ -299,7 +338,7 @@ async function postTrending() {
       })
       .slice(0, 3)
       .map(p => ({
-        name: p.attributes.name,
+        name:  getPairView(p).name,
         delta: prevRankMap[p.attributes.address] - newRankMap[p.attributes.address],
       }));
 
@@ -320,7 +359,7 @@ async function postTrending() {
 
     await bot.pinChatMessage(TELEGRAM_CHAT_ID, msg.message_id, { disable_notification: true });
     lastPinnedId = msg.message_id;
-    prevRankMap = newRankMap;
+    prevRankMap  = newRankMap;
 
     console.log(`[TrendingBot] ✅ Posted trending (${trending.length} pools)`);
   } catch (e) {
