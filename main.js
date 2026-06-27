@@ -7,7 +7,7 @@ const {
   TELEGRAM_CHAT_ID,
   POLL_INTERVAL_MINUTES = '5',
   TRENDING_SIZE = '8',
-  MIN_LIQ = '1500',
+  MIN_LIQ = '200',
 } = process.env;
 
 if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
@@ -84,13 +84,9 @@ function isGoodPool(p) {
   const txH1 = a.transactions?.h1 || {};
   const txM5 = a.transactions?.m5 || {};
 
+  // On a new/low-activity chain just block pools with no liquidity at all
   if (liq < Number(MIN_LIQ)) return false;
-  if (volH24 < 200) return false;
-  if ((txH24.buys || 0) + (txH24.sells || 0) < 3) return false;
-
-  // Skip pools with zero activity in the last hour AND last 5 minutes
-  const recentTxns = (txH1.buys || 0) + (txH1.sells || 0) + (txM5.buys || 0) + (txM5.sells || 0);
-  if (recentTxns === 0 && volH1 === 0) return false;
+  if ((txH24.buys || 0) + (txH24.sells || 0) + (txH1.buys || 0) + (txM5.buys || 0) < 1) return false;
 
   return true;
 }
@@ -174,7 +170,7 @@ async function sendNewPoolAlerts(pools) {
     const liq = Number(a.reserve_in_usd || 0);
     const volH1 = Number(a.volume_usd?.h1 || 0);
     const volM5 = Number(a.volume_usd?.m5 || 0);
-    if (liq < 1500 && volH1 < 300) continue;
+    if (liq < 200) continue;
 
     alertedPools.set(a.address, Date.now());
 
