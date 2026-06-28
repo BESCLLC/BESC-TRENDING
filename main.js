@@ -15,26 +15,38 @@ if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
   throw new Error('Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID');
 
 const bot = new TelegramBot(TELEGRAM_TOKEN);
-let lastPinnedId = null;
-let prevRankMap  = {};
-let prevH24Vol   = {};
-let alertedPools     = new Map(); // address -> timestamp
-const launchPriceCache = new Map(); // address -> USD open price of earliest candle
+let lastPinnedId     = null;
+let prevRankMap      = {};
+let prevH24Vol       = {};
+let alertedPools     = new Map();
+const launchPriceCache = new Map(); // address -> USD open price at pool launch
 
 const CHAIN_NATIVE = 'WBESC';
 
-// Any bridged external asset that GeckoTerminal may index as the "base" —
-// when paired with WBESC as quote we flip it so WBESC is the base token.
+// Bridged external assets — when these are the base with WBESC as quote,
+// the pair is indexed backwards and gets flipped + moved to a price-reference section
 const FLIP_IF_BASE = /^(WBNB|WETH|WBTC|WMATIC|WAVAX|WSOL|WXRP|WLTC|WDOT|WADA|WLINK|WATOM|WALGO|WXLM|WFTM|WONE|WCRO|WKCS|WGLMR|WMOVR|WFIL|WVET|WHBAR|WNEAR|WICP|WFLOW|WEGLD|BNB|ETH|BTC|XRP|SOL|MATIC|AVAX)/i;
 
-// Stablecoins — never useful in a trending list
 const STABLE_RE = /^(USDC|USDT|BUSD|BUSDC|FUSD|WUSD|DAI|FRAX|TUSD|USDD|LUSD|GUSD|USDP|MIM|CUSD|SUSD|HUSD|FDUSD|PYUSD|CRVUSD|USDB|DOLA|EURC|EURT|EURS|WUSDC|WUSDT)/i;
 
 const BLOCKED_SET = new Set(
   BLOCKED_TOKENS.split(',').map(t => t.trim().toUpperCase()).filter(Boolean)
 );
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function isBridgePair(p) {
+  const parts = (p.attributes.name || '').split('/').map(s => s.trim());
+  return FLIP_IF_BASE.test(parts[0]) && parts[1] === CHAIN_NATIVE;
+}
+
 // ─── Formatters ───────────────────────────────────────────────────────────────
+
+// Use UTC getters directly — toLocaleTimeString with hour12:false shows "24:xx" at midnight
+function fmtTime() {
+  const d = new Date();
+  return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+}
 
 function fmtUsd(n) {
   const num = Number(n);
@@ -82,9 +94,6 @@ function rankBadge(i) {
 }
 
 // ─── Pair orientation ──────────────────────────────────────────────────────────
-// GeckoTerminal sometimes indexes bridged assets (WBNB, WETH, WXRP…) as the
-// base token with WBESC as the quote. On BESC HyperChain, WBESC is the native
-// so we flip those pools: name, price, % changes, and buy/sell all invert.
 
 function getPairView(p) {
   const a         = p.attributes;
@@ -97,6 +106,7 @@ function getPairView(p) {
     const inv = x => -(Number(x) || 0);
     return {
       name:    `${CHAIN_NATIVE} / ${baseName}`,
+      partner: baseName,
       price:   a.quote_token_price_usd,
       mc:      null,
       chgM5:   inv(a.price_change_percentage?.m5),
@@ -111,6 +121,7 @@ function getPairView(p) {
 
   return {
     name:    a.name,
+    partner: null,
     price:   a.base_token_price_usd,
     mc:      a.market_cap_usd || a.fdv_usd,
     chgM5:   Number(a.price_change_percentage?.m5  || 0),
@@ -127,8 +138,8 @@ function getPairView(p) {
 
 function isGoodPool(p) {
   const baseName = (p.attributes.name || '').split('/')[0].trim().toUpperCase();
-  if (STABLE_RE.test(baseName))   return false;
-  if (BLOCKED_SET.has(baseName))  return false;
+  if (STABLE_RE.test(baseName))  return false;
+  if (BLOCKED_SET.has(baseName)) return false;
 
   const a     = p.attributes;
   const liq   = Number(a.reserve_in_usd || 0);
@@ -202,16 +213,10 @@ async function fetchPools() {
 }
 
 // ─── Launch price cache ────────────────────────────────────────────────────────
-// Fetches the earliest hourly OHLCV open price for pools we haven't seen before.
-// Cached permanently — launch price never changes. Skips flipped pairs since
-// their OHLCV tracks the external token (WBNB, WETH), not WBESC.
+// Only for native tokens — bridge pair OHLCV tracks the external asset, not WBESC
 
-async function fetchLaunchPrices(pools) {
-  const needed = pools.filter(p => {
-    const parts = (p.attributes.name || '').split('/').map(s => s.trim());
-    const isFlipped = FLIP_IF_BASE.test(parts[0]) && parts[1] === CHAIN_NATIVE;
-    return !isFlipped && !launchPriceCache.has(p.attributes.address);
-  });
+async function fetchLaunchPrices(nativePools) {
+  const needed = nativePools.filter(p => !launchPriceCache.has(p.attributes.address));
 
   for (const p of needed.slice(0, 5)) {
     const addr = p.attributes.address;
@@ -222,10 +227,15 @@ async function fetchLaunchPrices(pools) {
       );
       const list = (data.data?.attributes?.ohlcv_list || [])
         .slice()
-        .sort((a, b) => a[0] - b[0]); // ascending — oldest first
-      if (list.length && list[0][1] > 0) launchPriceCache.set(addr, list[0][1]);
-    } catch { /* skip silently */ }
-    await new Promise(r => setTimeout(r, 200)); // gentle rate-limit spacing
+        .sort((a, b) => a[0] - b[0]); // ascending — oldest candle first
+      if (list.length && list[0][1] > 0) {
+        launchPriceCache.set(addr, list[0][1]);
+        console.log(`[TrendingBot] Launch price: ${p.attributes.name} = $${list[0][1]}`);
+      }
+    } catch (e) {
+      console.error(`[TrendingBot] OHLCV failed for ${addr}: ${e.message}`);
+    }
+    await new Promise(r => setTimeout(r, 200));
   }
 }
 
@@ -241,16 +251,15 @@ async function sendNewPoolAlerts(pools) {
 
     const ageMins = (Date.now() - new Date(a.pool_created_at).getTime()) / 60000;
     if (ageMins > 30) continue;
-
-    const liq = Number(a.reserve_in_usd || 0);
-    if (liq < 200) continue;
+    if (Number(a.reserve_in_usd || 0) < 200) continue;
 
     alertedPools.set(a.address, Date.now());
 
-    const pv     = getPairView(p);
-    const price  = fmtPrice(pv.price);
-    const total  = pv.buysH1 + pv.sellsH1;
-    const buyPct = total > 0 ? Math.round(pv.buysH1 / total * 100) : 50;
+    const pv    = getPairView(p);
+    const price = fmtPrice(pv.price);
+    const total = pv.buysH1 + pv.sellsH1;
+    const buyPct = total > 0 ? Math.round(pv.buysH1 / total * 100) : null;
+    const liq   = Number(a.reserve_in_usd || 0);
 
     await bot.sendMessage(TELEGRAM_CHAT_ID,
       `🆕 <b>NEW POOL LAUNCHED</b>\n` +
@@ -258,90 +267,113 @@ async function sendNewPoolAlerts(pools) {
       `<b>${pv.name}</b>  ·  ${ageStr(a.pool_created_at)} old\n` +
       (price ? `💰 <b>${price}</b>${pv.mc ? `  ·  MC: ${fmtUsd(pv.mc)}` : ''}\n` : '') +
       `📊 1h: <b>${fmtPct(pv.chgH1)}</b>  ·  24h: <b>${fmtPct(pv.chgH24)}</b>\n` +
-      `💧 Vol 1h: ${fmtUsd(pv.volH1)}  ·  Liq: ${fmtUsd(liq)}\n` +
-      `🔄 ${pv.buysH1}B / ${pv.sellsH1}S  (${buyPct}% buy)\n` +
+      `💧 Vol: ${fmtUsd(pv.volH1)}  ·  Liq: ${fmtUsd(liq)}\n` +
+      (buyPct !== null ? `🔄 ${pv.buysH1}B / ${pv.sellsH1}S  (${buyPct}% buy)\n` : '') +
       `<a href="https://www.geckoterminal.com/besc-hyperchain/pools/${a.address}">📈 Open Chart</a>`,
       { parse_mode: 'HTML', disable_web_page_preview: true }
     ).catch(e => console.error('[TrendingBot] Alert failed:', e.message));
   }
 }
 
-// ─── Trending message ──────────────────────────────────────────────────────────
+// ─── Message builder ───────────────────────────────────────────────────────────
 
 const SEP = '——————————————————';
 
-function formatTrending(pools, movers) {
-  const time = new Date().toLocaleTimeString('en-US', {
-    hour: '2-digit', minute: '2-digit', timeZone: 'UTC', hour12: false,
-  });
+function buildPoolEntry(p, rank) {
+  const a  = p.attributes;
+  const pv = getPairView(p);
 
-  if (!pools.length) {
-    return (
-      `🔥 <b>BESC HyperChain — Trending</b>\n` +
-      `🕒 ${time} UTC\n\n` +
-      `${SEP}\n` +
-      `😴 <b>No active pools right now</b>\n` +
-      `Chain is quiet — check back soon!\n` +
-      `${SEP}\n\n` +
-      `<a href="https://www.geckoterminal.com/besc-hyperchain/pools">Browse all pools ↗</a>`
-    );
+  const price  = fmtPrice(pv.price);
+  const total  = pv.buysH1 + pv.sellsH1;
+  const buyPct = total > 0 ? Math.round(pv.buysH1 / total * 100) : null;
+
+  // X since launch (all non-bridge pools)
+  const launchP = launchPriceCache.get(a.address);
+  const currP   = Number(pv.price);
+  let xTag = '';
+  if (launchP > 0 && currP > 0) {
+    const mult = currP / launchP;
+    if (mult >= 10)      xTag = ` 🔥${mult.toFixed(0)}x`;
+    else if (mult >= 2)  xTag = ` 💎${mult.toFixed(1)}x`;
+    else if (mult >= 1.1) xTag = ` 📈${mult.toFixed(1)}x`;
+    else if (mult < 0.9) xTag = ` 📉${mult.toFixed(2)}x`;
   }
+
+  // Volume acceleration vs h24 rolling average
+  const h24avg   = pv.volH24 / 24;
+  const accel    = h24avg > 50 ? pv.volH1 / h24avg : null;
+  const accelTag = accel && accel > 2 ? ` ⚡${accel.toFixed(1)}x vol` : '';
+
+  // Rank change since last poll
+  const prevRank = prevRankMap[a.address];
+  let rankTag = '';
+  if (prevRank !== undefined && prevRank !== rank) {
+    const d = prevRank - rank;
+    rankTag = d > 0 ? ` 🔺+${d}` : ` 🔻${Math.abs(d)}`;
+  }
+
+  // Age tag for pools < 12h old
+  const ageH   = (Date.now() - new Date(a.pool_created_at).getTime()) / 3_600_000;
+  const ageTag = ageH < 12 ? ` 🆕 ${ageStr(a.pool_created_at)}` : '';
+
+  const bpEmoji = buyPct !== null
+    ? (buyPct >= 70 ? ' 🟢' : buyPct >= 55 ? ' 📈' : buyPct <= 30 ? ' 🔴' : '')
+    : '';
+
+  const txLine = buyPct !== null
+    ? `🔄 ${pv.buysH1}B / ${pv.sellsH1}S  (${buyPct}% buy)${bpEmoji}`
+    : `🔄 No trades in last hour`;
+
+  const link = `https://www.geckoterminal.com/besc-hyperchain/pools/${a.address}`;
+
+  return (
+    `${rankBadge(rank)} <b>${pv.name}</b>${rankTag}${xTag}${accelTag}${ageTag}\n` +
+    (price ? `💰 <b>${price}</b>${pv.mc ? `  ·  MC: ${fmtUsd(pv.mc)}` : ''}\n` : '') +
+    `${moodEmoji(pv.chgM5, pv.chgH1)} 5m: <b>${fmtPct(pv.chgM5)}</b>  1h: <b>${fmtPct(pv.chgH1)}</b>  24h: <b>${fmtPct(pv.chgH24)}</b>\n` +
+    `💧 Vol: ${fmtUsd(pv.volH1)}  ·  Liq: ${fmtUsd(a.reserve_in_usd)}\n` +
+    `${txLine}  <a href="${link}">Chart ↗</a>`
+  );
+}
+
+// ─── Trending message ──────────────────────────────────────────────────────────
+// Native tokens get the full trending layout.
+// Bridge pairs (WBESC/WBNB etc.) go into a compact price-reference section below.
+
+function formatTrending(nativePools, bridgePools, movers) {
+  const time = fmtTime();
 
   const lines = [
     `🔥 <b>BESC HyperChain — Trending</b>`,
-    `🕒 ${time} UTC${movers.length ? `  ·  ⬆️ Movers: ${movers.map(m => `${m.name} ↑${m.delta}`).join('  ')}` : ''}`,
+    `🕒 ${time} UTC${movers.length ? `  ·  ⬆️ ${movers.map(m => `${m.name} ↑${m.delta}`).join('  ')}` : ''}`,
   ];
 
-  for (let i = 0; i < pools.length; i++) {
-    const p  = pools[i];
-    const a  = p.attributes;
-    const pv = getPairView(p);
+  if (!nativePools.length && !bridgePools.length) {
+    lines.push(`\n${SEP}\n😴 <b>No active pools right now</b>\nChain is quiet — check back soon!\n${SEP}`);
+    lines.push(`<a href="https://www.geckoterminal.com/besc-hyperchain/pools">Browse all pools ↗</a>`);
+    return lines.join('\n');
+  }
 
-    const price   = fmtPrice(pv.price);
-    const total   = pv.buysH1 + pv.sellsH1;
-    const buyPct  = total > 0 ? Math.round(pv.buysH1 / total * 100) : 50;
-
-    // X since launch — compare current price to earliest OHLCV open price
-    const launchP = launchPriceCache.get(a.address);
-    const currP   = Number(pv.price);
-    let xTag = '';
-    if (launchP > 0 && currP > 0) {
-      const mult = currP / launchP;
-      if (mult >= 10)  xTag = ` 🔥${mult.toFixed(0)}x`;
-      else if (mult >= 2) xTag = ` 💎${mult.toFixed(1)}x`;
-      else if (mult >= 1.5) xTag = ` 📈${mult.toFixed(1)}x`;
+  // ── Native token trending ──────────────────────────────────────────────────
+  if (nativePools.length) {
+    for (let i = 0; i < nativePools.length; i++) {
+      lines.push(`\n${SEP}\n${buildPoolEntry(nativePools[i], i)}`);
     }
+  } else {
+    lines.push(`\n${SEP}\n<i>No native token activity right now</i>`);
+  }
 
-    // Volume acceleration vs h24 rolling average
-    const h24avg   = pv.volH24 / 24;
-    const accel    = h24avg > 50 ? pv.volH1 / h24avg : null;
-    const accelTag = accel && accel > 1.5 ? ` ⚡${accel.toFixed(1)}x` : '';
-
-    // Rank movement since last poll
-    const prevRank = prevRankMap[a.address];
-    let rankTag = '';
-    if (prevRank !== undefined && prevRank !== i) {
-      const d = prevRank - i;
-      rankTag = d > 0 ? ` 🔺+${d}` : ` 🔻${Math.abs(d)}`;
+  // ── WBESC price reference (bridge pairs, compact) ──────────────────────────
+  if (bridgePools.length) {
+    lines.push(`\n${SEP}`);
+    lines.push(`💱 <b>WBESC Price</b>`);
+    for (const p of bridgePools.slice(0, 5)) {
+      const pv    = getPairView(p);
+      const price = fmtPrice(pv.price);
+      if (!price) continue;
+      lines.push(
+        `${pv.partner}: <b>${price}</b>  ${fmtPct(pv.chgH1)} 1h  ·  ${fmtPct(pv.chgH24)} 24h`
+      );
     }
-
-    // Age tag for pools under 12h
-    const ageH   = (Date.now() - new Date(a.pool_created_at).getTime()) / 3_600_000;
-    const ageTag = ageH < 12 ? ` 🆕 ${ageStr(a.pool_created_at)}` : '';
-
-    // Buy pressure signal
-    const bpEmoji = buyPct >= 70 ? ' 🟢' : buyPct >= 55 ? ' 📈' : buyPct <= 30 ? ' 🔴' : '';
-
-    const link = `https://www.geckoterminal.com/besc-hyperchain/pools/${a.address}`;
-
-    lines.push(
-      `\n${SEP}\n` +
-      `${rankBadge(i)} <b>${pv.name}</b>${rankTag}${xTag}${accelTag}${ageTag}\n` +
-      (price ? `💰 <b>${price}</b>${pv.mc ? `  ·  MC: ${fmtUsd(pv.mc)}` : ''}\n` : '') +
-      `${moodEmoji(pv.chgM5, pv.chgH1)} 5m: <b>${fmtPct(pv.chgM5)}</b>  1h: <b>${fmtPct(pv.chgH1)}</b>  24h: <b>${fmtPct(pv.chgH24)}</b>\n` +
-      `💧 Vol: ${fmtUsd(pv.volH1)}  ·  Liq: ${fmtUsd(a.reserve_in_usd)}\n` +
-      `🔄 ${pv.buysH1}B / ${pv.sellsH1}S  (${buyPct}% buy)${bpEmoji}  <a href="${link}">Chart ↗</a>`
-    );
   }
 
   lines.push(`\n${SEP}`);
@@ -354,20 +386,23 @@ function formatTrending(pools, movers) {
 
 async function postTrending() {
   try {
-    const pools = await fetchPools();
+    const allPools = await fetchPools();
 
-    pools.sort((a, b) => hotness(b) - hotness(a));
+    allPools.sort((a, b) => hotness(b) - hotness(a));
 
-    await fetchLaunchPrices(pools); // runs after sort so we prioritise top pools
+    // Split native tokens from bridge pairs
+    const nativePools = allPools.filter(p => !isBridgePair(p));
+    const bridgePools = allPools.filter(p =>  isBridgePair(p));
 
+    // Track ranks and h24 volumes for native tokens only
     const newRankMap = {};
-    for (let i = 0; i < pools.length; i++) {
-      const addr = pools[i].attributes.address;
+    for (let i = 0; i < nativePools.length; i++) {
+      const addr = nativePools[i].attributes.address;
       newRankMap[addr] = i;
-      prevH24Vol[addr] = Number(pools[i].attributes.volume_usd?.h24 || 0);
+      prevH24Vol[addr] = Number(nativePools[i].attributes.volume_usd?.h24 || 0);
     }
 
-    const movers = pools
+    const movers = nativePools
       .filter(p => {
         const prev = prevRankMap[p.attributes.address];
         return prev !== undefined && prev - newRankMap[p.attributes.address] >= 3;
@@ -378,9 +413,10 @@ async function postTrending() {
         delta: prevRankMap[p.attributes.address] - newRankMap[p.attributes.address],
       }));
 
-    await sendNewPoolAlerts(pools);
+    await fetchLaunchPrices(nativePools);
+    await sendNewPoolAlerts(allPools);
 
-    const trending = pools.slice(0, Number(TRENDING_SIZE));
+    const trendingNative = nativePools.slice(0, Number(TRENDING_SIZE));
 
     if (lastPinnedId) {
       await bot.unpinAllChatMessages(TELEGRAM_CHAT_ID).catch(() => {});
@@ -389,7 +425,7 @@ async function postTrending() {
 
     const msg = await bot.sendMessage(
       TELEGRAM_CHAT_ID,
-      formatTrending(trending, movers),
+      formatTrending(trendingNative, bridgePools, movers),
       { parse_mode: 'HTML', disable_web_page_preview: true }
     );
 
@@ -397,7 +433,7 @@ async function postTrending() {
     lastPinnedId = msg.message_id;
     prevRankMap  = newRankMap;
 
-    console.log(`[TrendingBot] ✅ Posted trending (${trending.length} pools)`);
+    console.log(`[TrendingBot] ✅ Posted: ${trendingNative.length} native, ${bridgePools.length} bridge`);
   } catch (e) {
     console.error('[TrendingBot] Failed to post trending:', e.message);
   }
