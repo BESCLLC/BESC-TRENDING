@@ -18,7 +18,8 @@ const bot = new TelegramBot(TELEGRAM_TOKEN);
 let lastPinnedId = null;
 let prevRankMap  = {};
 let prevH24Vol   = {};
-let alertedPools = new Map();
+let alertedPools     = new Map(); // address -> timestamp
+const launchPriceCache = new Map(); // address -> USD open price of earliest candle
 
 const CHAIN_NATIVE = 'WBESC';
 
@@ -200,6 +201,34 @@ async function fetchPools() {
   });
 }
 
+// ─── Launch price cache ────────────────────────────────────────────────────────
+// Fetches the earliest hourly OHLCV open price for pools we haven't seen before.
+// Cached permanently — launch price never changes. Skips flipped pairs since
+// their OHLCV tracks the external token (WBNB, WETH), not WBESC.
+
+async function fetchLaunchPrices(pools) {
+  const needed = pools.filter(p => {
+    const parts = (p.attributes.name || '').split('/').map(s => s.trim());
+    const isFlipped = FLIP_IF_BASE.test(parts[0]) && parts[1] === CHAIN_NATIVE;
+    return !isFlipped && !launchPriceCache.has(p.attributes.address);
+  });
+
+  for (const p of needed.slice(0, 5)) {
+    const addr = p.attributes.address;
+    try {
+      const { data } = await axios.get(
+        `https://api.geckoterminal.com/api/v2/networks/besc-hyperchain/pools/${addr}/ohlcv/hour`,
+        { params: { limit: 1000, currency: 'usd' }, timeout: 10000 }
+      );
+      const list = (data.data?.attributes?.ohlcv_list || [])
+        .slice()
+        .sort((a, b) => a[0] - b[0]); // ascending — oldest first
+      if (list.length && list[0][1] > 0) launchPriceCache.set(addr, list[0][1]);
+    } catch { /* skip silently */ }
+    await new Promise(r => setTimeout(r, 200)); // gentle rate-limit spacing
+  }
+}
+
 // ─── New pool alerts ───────────────────────────────────────────────────────────
 
 async function sendNewPoolAlerts(pools) {
@@ -272,6 +301,17 @@ function formatTrending(pools, movers) {
     const total   = pv.buysH1 + pv.sellsH1;
     const buyPct  = total > 0 ? Math.round(pv.buysH1 / total * 100) : 50;
 
+    // X since launch — compare current price to earliest OHLCV open price
+    const launchP = launchPriceCache.get(a.address);
+    const currP   = Number(pv.price);
+    let xTag = '';
+    if (launchP > 0 && currP > 0) {
+      const mult = currP / launchP;
+      if (mult >= 10)  xTag = ` 🔥${mult.toFixed(0)}x`;
+      else if (mult >= 2) xTag = ` 💎${mult.toFixed(1)}x`;
+      else if (mult >= 1.5) xTag = ` 📈${mult.toFixed(1)}x`;
+    }
+
     // Volume acceleration vs h24 rolling average
     const h24avg   = pv.volH24 / 24;
     const accel    = h24avg > 50 ? pv.volH1 / h24avg : null;
@@ -296,7 +336,7 @@ function formatTrending(pools, movers) {
 
     lines.push(
       `\n${SEP}\n` +
-      `${rankBadge(i)} <b>${pv.name}</b>${rankTag}${accelTag}${ageTag}\n` +
+      `${rankBadge(i)} <b>${pv.name}</b>${rankTag}${xTag}${accelTag}${ageTag}\n` +
       (price ? `💰 <b>${price}</b>${pv.mc ? `  ·  MC: ${fmtUsd(pv.mc)}` : ''}\n` : '') +
       `${moodEmoji(pv.chgM5, pv.chgH1)} 5m: <b>${fmtPct(pv.chgM5)}</b>  1h: <b>${fmtPct(pv.chgH1)}</b>  24h: <b>${fmtPct(pv.chgH24)}</b>\n` +
       `💧 Vol: ${fmtUsd(pv.volH1)}  ·  Liq: ${fmtUsd(a.reserve_in_usd)}\n` +
@@ -317,6 +357,8 @@ async function postTrending() {
     const pools = await fetchPools();
 
     pools.sort((a, b) => hotness(b) - hotness(a));
+
+    await fetchLaunchPrices(pools); // runs after sort so we prioritise top pools
 
     const newRankMap = {};
     for (let i = 0; i < pools.length; i++) {
